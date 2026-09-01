@@ -16,6 +16,7 @@ import { TEXTO_AGRADECIMENTO, mensagemJaRegistrada, tentarRegistrarAvaliacao } f
 import { obterOuCriarCanal } from '../channels/registry.js';
 import { enfileirarMidia } from './filaMidia.js';
 import { apagar as apagarObjeto } from './midiaStorage.js';
+import { CONFIRMACAO_OPT_OUT, tratarPossivelDescadastro } from './optOut.js';
 
 const UNIQUE_VIOLATION = '23505';
 
@@ -767,9 +768,75 @@ export async function processarEventoRecebido(canalId: string, evento: EventoRec
   // cliente" e "risco de perder a venda" não têm significado num chat com 30
   // pessoas falando de assuntos diferentes. Ligar isso é decisão futura, com
   // prompt próprio, não um efeito colateral desta feature.
+  // DESCADASTRO — antes de qualquer processamento de IA, e com saida
+  // imediata da funcao.
+  //
+  // A mensagem de campanha diz "responda SAIR". Sem este bloco ela mente: a
+  // pessoa responde, alguem le depois, e a proxima onda sai assim mesmo.
+  //
+  // A ordem importa. Resumo, analise de sentimento e (na Fase 4) triagem e
+  // resposta automatica NAO rodam para quem acabou de pedir para sair —
+  // gastar token analisando o sentimento de "me tira dessa lista" e a
+  // definicao de nao ter entendido o pedido.
+  //
+  // Grupo fica de fora: `clienteId` ali e o grupo, nao uma pessoa, e
+  // descadastrar um grupo inteiro porque um participante escreveu "sair"
+  // seria pior que o problema.
+  if (!deAtendente && !ehGrupo) {
+    const pediuParaSair = await tratarPossivelDescadastro(clienteId, evento.texto);
+    if (pediuParaSair) {
+      await confirmarSaida(canal.id, conversaId, telefone, evento.waJidOrigem);
+      return;
+    }
+  }
+
+  // Resumo de IA do caso (plano "Resumo de IA no Kanban") e análise de
+  // sentimento/risco (PLANO_IA_SENTIMENTO_ALERTAS_ALICE_CSAT.md) — só em
+  // mensagem de entrada (cliente), sem await: fire-and-forget, nunca atrasa
+  // nem derruba o processamento da mensagem em si.
   if (!deAtendente && !ehGrupo) {
     agendarResumoDebounced(conversaId);
     agendarAnaliseDebounced(conversaId);
+  }
+}
+
+/**
+ * Confirma o descadastro para quem pediu.
+ *
+ * Best-effort de proposito: o descadastro JA esta gravado quando isto roda,
+ * e e ele que barra o envio. Se a confirmacao nao sair (linha caida, numero
+ * invalido), a pessoa deixa de receber do mesmo jeito — o inverso, gravar a
+ * confirmacao sem gravar o descadastro, seria o desastre.
+ */
+async function confirmarSaida(
+  canalId: string,
+  conversaId: string,
+  telefone: string,
+  waJidDestino?: string,
+): Promise<void> {
+  try {
+    const canal = await obterOuCriarCanal(canalId);
+    const envio = await canal.enviar({
+      conversaId,
+      telefone,
+      texto: CONFIRMACAO_OPT_OUT,
+      waJidDestino,
+    });
+    await supabaseAdmin.from('mensagens').insert({
+      conversa_id: conversaId,
+      wa_message_id: envio.waMessageId || null,
+      autor: 'atendente',
+      direcao: 'saida',
+      texto: CONFIRMACAO_OPT_OUT,
+      status_entrega: envio.status === 'enviada' ? 'enviada' : 'falhou',
+      erro: envio.erro ?? null,
+    });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `descadastro gravado, mas a confirmação não saiu (conversa ${conversaId}): ` +
+        (err instanceof Error ? err.message : String(err)),
+    );
   }
 }
 

@@ -161,6 +161,13 @@ vi.mock('../db/client.server.js', () => ({
   },
 }));
 
+/** O fluxo de descadastro responde a confirmacao pelo canal. Sem este mock,
+ *  o teste tentaria abrir um socket de WhatsApp de verdade. */
+const enviarMock = vi.fn(async () => ({ waMessageId: 'wa-confirma', status: 'enviada' as const }));
+vi.mock('../channels/registry.js', () => ({
+  obterOuCriarCanal: async () => ({ enviar: enviarMock }),
+}));
+
 const { processarEventoRecebido, normalizarTelefone } = await import('./mensagens.js');
 
 const EMPRESA_ID = 'empresa-1';
@@ -765,5 +772,74 @@ describe('processarEventoRecebido — data/hora real da mensagem e ordem da Caix
       });
     }
     expect(tabelas.conversas[0]!.nao_lidas).toBe(2);
+  });
+});
+
+describe('processarEventoRecebido — descadastro pedido pelo eleitor', () => {
+  beforeEach(() => {
+    seed();
+    proximoId = 0;
+    vi.clearAllMocks();
+    enviarMock.mockResolvedValue({ waMessageId: 'wa-confirma', status: 'enviada' as const });
+  });
+
+  async function chegaMensagem(texto: string, waMessageId = 'wa-x') {
+    await processarEventoRecebido(CANAL_ID, {
+      waMessageId,
+      telefone: TELEFONE_BRUTO,
+      texto,
+      origem: 'cliente',
+      recebidoEm: new Date(),
+      nomeContato: 'Maria Silva',
+    });
+  }
+
+  it('grava o opt-out quando a pessoa responde SAIR', async () => {
+    await chegaMensagem('oi, recebi a mensagem', 'wa-1');
+    expect(cliente()?.opt_out_em).toBeFalsy();
+
+    await chegaMensagem('SAIR', 'wa-2');
+    expect(cliente()?.opt_out_em).toBeTruthy();
+    expect(cliente()?.situacao).toBe('opt_out');
+    expect(String(cliente()?.opt_out_motivo)).toContain('SAIR');
+  });
+
+  it('confirma para a pessoa que ela saiu', async () => {
+    await chegaMensagem('não quero mais receber');
+    expect(enviarMock).toHaveBeenCalledTimes(1);
+    expect(String(enviarMock.mock.calls[0][0].texto)).toContain('não receberá mais mensagens');
+  });
+
+  it('a confirmação fica registrada na conversa', async () => {
+    await chegaMensagem('me tira dessa lista');
+    const saidas = tabelas.mensagens.filter((m) => m.direcao === 'saida');
+    expect(saidas).toHaveLength(1);
+    expect(saidas[0].autor).toBe('atendente');
+  });
+
+  it('mensagem comum não descadastra ninguém', async () => {
+    await chegaMensagem('Bom dia! Vocês vão fazer algo pelo bairro?');
+    expect(cliente()?.opt_out_em).toBeFalsy();
+    expect(enviarMock).not.toHaveBeenCalled();
+  });
+
+  it('não confirma duas vezes se a pessoa insistir', async () => {
+    await chegaMensagem('SAIR', 'wa-1');
+    expect(enviarMock).toHaveBeenCalledTimes(1);
+
+    // Pediu de novo: já estava fora, então nada muda no cadastro. A
+    // confirmação sai outra vez de propósito — a pessoa está perguntando se
+    // funcionou, e o silêncio é a pior resposta possível.
+    const quando = cliente()?.opt_out_em;
+    await chegaMensagem('PARE', 'wa-2');
+    expect(cliente()?.opt_out_em).toBe(quando);
+  });
+
+  it('a falha ao confirmar não desfaz o descadastro', async () => {
+    // O descadastro é o que barra o envio. Perder a confirmação é ruim;
+    // perder o descadastro é o desastre.
+    enviarMock.mockRejectedValue(new Error('linha caída'));
+    await chegaMensagem('descadastrar');
+    expect(cliente()?.opt_out_em).toBeTruthy();
   });
 });
