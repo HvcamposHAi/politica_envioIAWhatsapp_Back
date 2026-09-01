@@ -29,12 +29,19 @@ vi.mock('../auth/escopoConversa.js', () => ({
   empresasDoAtendente: vi.fn(async () => new Set([EMPRESA])),
 }));
 
+const gerarLoteMock = vi.fn();
+vi.mock('../services/personalizacaoIA.js', () => ({
+  gerarLote: (base: string, lote: unknown[]) => gerarLoteMock(base, lote),
+  emLotes: (itens: unknown[]) => (itens.length ? [itens] : []),
+}));
+
 const pararTudoMock = vi.fn(async (_motivo: string) => 2);
 const religarMock = vi.fn();
 vi.mock('../jobs/disparador.js', () => ({
   pararTudo: (m: string) => pararTudoMock(m),
   religarDisparos: () => religarMock(),
   disparoHabilitado: () => true,
+  primeiroNome: (n: string) => n.trim().split(/\s+/)[0] ?? '',
 }));
 
 interface Est {
@@ -76,6 +83,11 @@ vi.mock('../db/client.server.js', () => {
       this.filtros.push(['in', k, v]);
       return this;
     }
+    /** `.not('texto_gerado', 'is', null)` — usado pela trava da amostra. */
+    not(k: string, _op: string, _v: unknown) {
+      this.filtros.push(['notnull', k, null]);
+      return this;
+    }
     overlaps() {
       return this;
     }
@@ -98,7 +110,11 @@ vi.mock('../db/client.server.js', () => {
     private casadas() {
       return fonte(this.t).filter((l) =>
         this.filtros.every(([tipo, k, v]) =>
-          tipo === 'in' ? (v as unknown[]).includes(l[k]) : l[k] === v,
+          tipo === 'in'
+            ? (v as unknown[]).includes(l[k])
+            : tipo === 'notnull'
+              ? l[k] !== null && l[k] !== undefined
+              : l[k] === v,
         ),
       );
     }
@@ -419,5 +435,140 @@ describe('POST /disparos/previsualizar', () => {
       .set('x-teste-user-id', ADMIN)
       .send({ empresaId: EMPRESA, textoBase: '   ' });
     expect(r.status).toBe(400);
+  });
+});
+
+describe('trava da amostra de IA', () => {
+  beforeEach(() => {
+    est.disparos = [
+      {
+        id: 'd1',
+        empresa_id: EMPRESA,
+        status: 'rascunho',
+        canal_id: 'canal-1',
+        lista_id: 'lista-1',
+        texto_base: 'Oi {{primeiro_nome}}, aqui é da campanha. Responda SAIR para não receber mais.',
+        pausado_em: null,
+        amostra_aprovada_em: null,
+      },
+    ];
+  });
+
+  it('RECUSA iniciar com texto personalizado e amostra não aprovada', async () => {
+    // O validador anti-invenção reduz o risco de conteúdo falso; ele não
+    // substitui alguém conferindo o tom antes de milhares de mensagens.
+    est.alvos = [
+      { id: 'a1', disparo_id: 'd1', status: 'pendente', texto_gerado: 'Oi Maria, aqui é da campanha.' },
+    ];
+    const r = await request(app)
+      .post('/disparos/d1/iniciar')
+      .set('x-teste-user-id', ADMIN)
+      .send({ empresaId: EMPRESA });
+    expect(r.status).toBe(409);
+    expect(r.body.error).toContain('amostra');
+    expect(est.disparos[0].status).toBe('rascunho');
+  });
+
+  it('deixa iniciar depois da amostra aprovada', async () => {
+    est.alvos = [
+      { id: 'a1', disparo_id: 'd1', status: 'pendente', texto_gerado: 'Oi Maria, aqui é da campanha.' },
+    ];
+    const aprovar = await request(app)
+      .post('/disparos/d1/aprovar-amostra')
+      .set('x-teste-user-id', ADMIN)
+      .send({ empresaId: EMPRESA });
+    expect(aprovar.status).toBe(200);
+    expect(est.disparos[0].amostra_aprovada_em).toBeTruthy();
+
+    const r = await request(app)
+      .post('/disparos/d1/iniciar')
+      .set('x-teste-user-id', ADMIN)
+      .send({ empresaId: EMPRESA });
+    expect(r.status).toBe(200);
+    expect(est.disparos[0].status).toBe('enviando');
+  });
+
+  it('disparo SEM personalização não precisa de aprovação de amostra', async () => {
+    // A trava é sobre texto que a IA escreveu, não sobre disparo em geral.
+    est.alvos = [{ id: 'a1', disparo_id: 'd1', status: 'pendente', texto_gerado: null }];
+    const r = await request(app)
+      .post('/disparos/d1/iniciar')
+      .set('x-teste-user-id', ADMIN)
+      .send({ empresaId: EMPRESA });
+    expect(r.status).toBe(200);
+  });
+
+  it('personalizar de novo invalida a aprovação anterior', async () => {
+    // A amostra aprovada não é mais a que vai sair.
+    est.disparos[0].amostra_aprovada_em = '2026-09-01T10:00:00Z';
+    est.alvos = [
+      {
+        id: 'a1',
+        disparo_id: 'd1',
+        status: 'pendente',
+        cliente_id: 'cli-1',
+        texto_gerado: null,
+        clientes: { nome: 'Maria Silva', bairro: 'Centro', cidade: 'Timbó', tags: [] },
+      },
+    ];
+    gerarLoteMock.mockResolvedValue([
+      { alvoId: 'a1', texto: 'Oi Maria, aqui é da campanha. Responda SAIR.', personalizada: true },
+    ]);
+
+    const r = await request(app)
+      .post('/disparos/d1/personalizar')
+      .set('x-teste-user-id', ADMIN)
+      .send({ empresaId: EMPRESA });
+    expect(r.status).toBe(200);
+    expect(r.body.personalizadas).toBe(1);
+    expect(est.disparos[0].amostra_aprovada_em).toBeNull();
+    expect(est.alvos[0].texto_gerado).toContain('Maria');
+  });
+
+  it('relata os motivos de descarte — é informação sobre o TEXTO-BASE', async () => {
+    // Taxa alta de descarte quase sempre significa que o texto-base está
+    // induzindo o modelo a inventar.
+    est.alvos = [
+      {
+        id: 'a1',
+        disparo_id: 'd1',
+        status: 'pendente',
+        cliente_id: 'cli-1',
+        texto_gerado: null,
+        clientes: { nome: 'Maria Silva', bairro: 'Centro', cidade: 'Timbó', tags: [] },
+      },
+    ];
+    gerarLoteMock.mockResolvedValue([
+      {
+        alvoId: 'a1',
+        texto: 'texto-base de fallback',
+        personalizada: false,
+        motivoDescarte: 'número "3" não está no texto-base',
+      },
+    ]);
+
+    const r = await request(app)
+      .post('/disparos/d1/personalizar')
+      .set('x-teste-user-id', ADMIN)
+      .send({ empresaId: EMPRESA });
+    expect(r.body.descartadas).toBe(1);
+    expect(r.body.motivosDeDescarte['número "3" não está no texto-base']).toBe(1);
+  });
+
+  it('recusa personalizar disparo que já está enviando', async () => {
+    est.disparos[0].status = 'enviando';
+    const r = await request(app)
+      .post('/disparos/d1/personalizar')
+      .set('x-teste-user-id', ADMIN)
+      .send({ empresaId: EMPRESA });
+    expect(r.status).toBe(409);
+    expect(gerarLoteMock).not.toHaveBeenCalled();
+  });
+
+  it('operador não personaliza nem aprova amostra', async () => {
+    for (const caminho of ['/disparos/d1/personalizar', '/disparos/d1/aprovar-amostra']) {
+      const r = await request(app).post(caminho).set('x-teste-user-id', OPERADOR).send({ empresaId: EMPRESA });
+      expect(r.status).toBe(403);
+    }
   });
 });

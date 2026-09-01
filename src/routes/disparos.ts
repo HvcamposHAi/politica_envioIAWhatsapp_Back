@@ -12,7 +12,8 @@ import { requireSupabaseAuth } from '../auth/middleware.js';
 import { supabaseAdmin } from '../db/client.server.js';
 import { buscarAtendenteAutenticado, empresasDoAtendente } from '../auth/escopoConversa.js';
 import { aplicarCampos, minutosDoDia } from '../services/ritmoDisparo.js';
-import { disparoHabilitado, pararTudo, religarDisparos } from '../jobs/disparador.js';
+import { disparoHabilitado, pararTudo, primeiroNome, religarDisparos } from '../jobs/disparador.js';
+import { emLotes, gerarLote, type EleitorParaPersonalizar } from '../services/personalizacaoIA.js';
 
 export const disparosRouter = Router();
 disparosRouter.use(requireSupabaseAuth());
@@ -45,7 +46,7 @@ async function exigirAdmin(
 async function disparoDaEmpresa(disparoId: string, empresaId: string) {
   const { data } = await supabaseAdmin
     .from('disparos')
-    .select('id, empresa_id, status, canal_id, lista_id, texto_base, pausado_em')
+    .select('id, empresa_id, status, canal_id, lista_id, texto_base, pausado_em, amostra_aprovada_em')
     .eq('id', disparoId)
     .maybeSingle<{
       id: string;
@@ -55,6 +56,7 @@ async function disparoDaEmpresa(disparoId: string, empresaId: string) {
       lista_id: string | null;
       texto_base: string | null;
       pausado_em: string | null;
+      amostra_aprovada_em: string | null;
     }>();
   if (!data || data.empresa_id !== empresaId) return null;
   return data;
@@ -340,6 +342,24 @@ disparosRouter.post('/disparos/:id/iniciar', async (req, res) => {
       return res.status(400).json({ error: 'Nenhum alvo pendente. Prepare a fila antes de iniciar.' });
     }
 
+    // TRAVA DA AMOSTRA. Se a IA personalizou, uma pessoa precisa ter olhado
+    // uma amostra antes de milhares de mensagens saírem com texto que
+    // ninguém leu. O validador anti-invenção reduz o risco de conteúdo
+    // falso; ele não substitui alguém conferindo o tom.
+    const { count: personalizados } = await supabaseAdmin
+      .from('disparo_alvos')
+      .select('id', { count: 'exact', head: true })
+      .eq('disparo_id', disparo.id)
+      .not('texto_gerado', 'is', null);
+
+    if (personalizados && !disparo.amostra_aprovada_em) {
+      return res.status(409).json({
+        error:
+          'Este disparo tem mensagens personalizadas por IA e a amostra ainda não foi aprovada. ' +
+          'Confira a amostra e aprove antes de iniciar.',
+      });
+    }
+
     const { error } = await supabaseAdmin
       .from('disparos')
       .update({
@@ -484,6 +504,161 @@ disparosRouter.post('/disparos/previsualizar', async (req, res) => {
     }));
 
     res.status(200).json({ exemplos });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Personalização por IA (Fase 4.1)
+// ---------------------------------------------------------------------
+
+/**
+ * POST /disparos/:id/personalizar — pré-gera a variação de cada alvo.
+ *
+ * PRÉ-GERAÇÃO, não geração no envio. Gerar durante o disparo faria a
+ * latência do modelo virar o intervalo entre mensagens: irregular, caro, e
+ * tirando do worker o controle do ritmo que a Fase 3 construiu.
+ *
+ * Chamar de novo REGERA tudo. É a forma de reagir a uma amostra ruim:
+ * ajusta o texto-base e personaliza outra vez.
+ */
+disparosRouter.post('/disparos/:id/personalizar', async (req, res) => {
+  try {
+    const ctx = await exigirAdmin(req.auth!.userId, req.body?.empresaId);
+    if ('erro' in ctx) return res.status(ctx.erro).json({ error: ctx.mensagem });
+
+    const disparo = await disparoDaEmpresa(req.params.id, ctx.empresaId);
+    if (!disparo) return res.status(404).json({ error: 'Disparo não encontrado.' });
+    if (disparo.status !== 'rascunho') {
+      return res.status(409).json({
+        error: `Disparo está em "${disparo.status}". Personalize antes de iniciar, não durante.`,
+      });
+    }
+    if (!disparo.texto_base?.trim()) {
+      return res.status(400).json({ error: 'Disparo sem texto-base.' });
+    }
+
+    const { data: alvos, error } = await supabaseAdmin
+      .from('disparo_alvos')
+      .select('id, cliente_id, clientes(nome, bairro, cidade, tags)')
+      .eq('disparo_id', disparo.id)
+      .eq('status', 'pendente');
+    if (error) throw new Error(error.message);
+
+    type Linha = {
+      id: string;
+      clientes: { nome: string; bairro: string | null; cidade: string | null; tags: string[] | null } | null;
+    };
+    const linhas = (alvos ?? []) as unknown as Linha[];
+    if (!linhas.length) {
+      return res.status(400).json({ error: 'Nenhum alvo pendente. Prepare a fila antes de personalizar.' });
+    }
+
+    const eleitores: EleitorParaPersonalizar[] = linhas
+      .filter((l) => l.clientes)
+      .map((l) => ({
+        alvoId: l.id,
+        nome: l.clientes!.nome,
+        primeiroNome: primeiroNome(l.clientes!.nome),
+        bairro: l.clientes!.bairro,
+        cidade: l.clientes!.cidade,
+        tags: l.clientes!.tags,
+      }));
+
+    let personalizadas = 0;
+    let descartadas = 0;
+    const motivos: Record<string, number> = {};
+
+    for (const lote of emLotes(eleitores)) {
+      const variacoes = await gerarLote(disparo.texto_base, lote);
+      for (const v of variacoes) {
+        if (v.personalizada) {
+          personalizadas += 1;
+        } else {
+          descartadas += 1;
+          if (v.motivoDescarte) motivos[v.motivoDescarte] = (motivos[v.motivoDescarte] ?? 0) + 1;
+        }
+        const { error: erroUpdate } = await supabaseAdmin
+          .from('disparo_alvos')
+          .update({ texto_gerado: v.texto })
+          .eq('id', v.alvoId);
+        if (erroUpdate) throw new Error(`falha ao gravar a variação: ${erroUpdate.message}`);
+      }
+    }
+
+    // Personalizar de novo invalida a aprovação anterior: a amostra que a
+    // pessoa aprovou não é mais a que vai sair.
+    await supabaseAdmin.from('disparos').update({ amostra_aprovada_em: null }).eq('id', disparo.id);
+
+    res.status(200).json({
+      total: eleitores.length,
+      personalizadas,
+      descartadas,
+      // Taxa alta de descarte quase sempre significa que o TEXTO-BASE está
+      // induzindo o modelo a inventar (pede número, promete algo vago). É
+      // informação sobre o texto, não sobre o modelo.
+      motivosDeDescarte: motivos,
+      proximoPasso: 'Confira a amostra e aprove antes de iniciar.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+/** GET /disparos/:id/amostra — o que uma pessoa precisa ler antes de
+ *  milhares de mensagens saírem. */
+disparosRouter.get('/disparos/:id/amostra', async (req, res) => {
+  try {
+    const ctx = await exigirAdmin(req.auth!.userId, req.query?.empresaId);
+    if ('erro' in ctx) return res.status(ctx.erro).json({ error: ctx.mensagem });
+
+    const disparo = await disparoDaEmpresa(req.params.id, ctx.empresaId);
+    if (!disparo) return res.status(404).json({ error: 'Disparo não encontrado.' });
+
+    const quantas = Math.min(Number(req.query?.quantas ?? 20) || 20, 50);
+    const { data, error } = await supabaseAdmin
+      .from('disparo_alvos')
+      .select('id, texto_gerado, clientes(nome, bairro)')
+      .eq('disparo_id', disparo.id)
+      .eq('status', 'pendente')
+      .limit(quantas);
+    if (error) throw new Error(error.message);
+
+    type Linha = {
+      id: string;
+      texto_gerado: string | null;
+      clientes: { nome: string; bairro: string | null } | null;
+    };
+    const amostra = ((data ?? []) as unknown as Linha[]).map((l) => ({
+      para: l.clientes?.nome ?? '(sem nome)',
+      bairro: l.clientes?.bairro ?? null,
+      texto: l.texto_gerado ?? disparo.texto_base ?? '',
+      personalizada: !!l.texto_gerado,
+    }));
+
+    res.status(200).json({ amostra, aprovadaEm: disparo.amostra_aprovada_em });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+/** POST /disparos/:id/aprovar-amostra — registra QUANDO a amostra foi
+ *  aprovada. A trava em /iniciar consulta isto. */
+disparosRouter.post('/disparos/:id/aprovar-amostra', async (req, res) => {
+  try {
+    const ctx = await exigirAdmin(req.auth!.userId, req.body?.empresaId);
+    if ('erro' in ctx) return res.status(ctx.erro).json({ error: ctx.mensagem });
+
+    const disparo = await disparoDaEmpresa(req.params.id, ctx.empresaId);
+    if (!disparo) return res.status(404).json({ error: 'Disparo não encontrado.' });
+
+    await supabaseAdmin
+      .from('disparos')
+      .update({ amostra_aprovada_em: new Date().toISOString() })
+      .eq('id', disparo.id);
+
+    res.status(200).json({ aprovada: true });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
