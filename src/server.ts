@@ -16,8 +16,10 @@
 //     Kanban de Chamados".
 //   · jobs/ (campanhas, reengajamento, health-check) (Fase 8)
 //   · /conversas/:id/transferir
-//   · /disparos + worker de fila (Fase 3 do PLANO_CAMPANHA_INDIARA.md).
-//     A importação de eleitores (Fase 2) JÁ existe: routes/importacao.ts.
+//   · Fases 4 a 6 do PLANO_CAMPANHA_INDIARA.md: personalização por IA,
+//     resposta 1:1 de campanha, triagem, painel e vocabulário.
+//     As Fases 2 e 3 JÁ estão aqui: routes/importacao.ts, routes/disparos.ts
+//     e jobs/disparador.ts.
 
 import express from 'express';
 import helmet from 'helmet';
@@ -34,11 +36,13 @@ import { atendentesRouter } from './routes/atendentes.js';
 import { contaRouter } from './routes/conta.js';
 import { configuracoesRouter } from './routes/configuracoes.js';
 import { importacaoRouter } from './routes/importacao.js';
+import { disparosRouter } from './routes/disparos.js';
 import { twilioWebhookRouter } from './webhooks/twilio.js';
 import { desconectarTodosOsCanais, reconectarCanaisAoSubir } from './channels/registry.js';
 import { iniciarVarreduraMidia } from './services/filaMidia.js';
 import { iniciarVigiaDeCanais } from './jobs/vigiaCanais.js';
 import { iniciarVigiaSemDono } from './jobs/vigiaSemDono.js';
+import { iniciarDisparador } from './jobs/disparador.js';
 
 const PORT = Number(process.env.PORT ?? 8081);
 
@@ -109,6 +113,7 @@ app.use(atendentesRouter);
 app.use(contaRouter);
 app.use(configuracoesRouter);
 app.use(importacaoRouter);
+app.use(disparosRouter);
 
 const server = app.listen(PORT, () => {
   // eslint-disable-next-line no-console
@@ -142,6 +147,12 @@ iniciarVigiaDeCanais();
 // esta com a tela aberta; isto alcanca a madrugada e o fim de semana.
 // Ver src/jobs/vigiaSemDono.ts e PLANO_GOVERNANCA_ACESSOS.md §7.4.
 iniciarVigiaSemDono();
+
+// Worker de disparo (Fase 3). Fila em processo, no MESMO processo que segura
+// os sockets do WhatsApp — ver o cabeçalho de jobs/disparador.ts. Ele confere
+// o interruptor geral (DISPARO_ATIVO / botão "parar tudo") em toda passada,
+// então subir com disparo desligado é seguro: o timer roda e não faz nada.
+iniciarDisparador();
 
 // Graceful shutdown (plano-base §4.4): fechar sockets do Baileys antes de
 // matar o processo, senão o WhatsApp marca desconexão suja — direto

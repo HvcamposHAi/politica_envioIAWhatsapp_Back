@@ -155,6 +155,15 @@ export interface ChannelPort {
 
   enviar(msg: EnvioMensagem): Promise<ResultadoEnvio>;
 
+  /** Mostra "digitando..." para o destinatario por `duracaoMs` antes de a
+   *  mensagem sair. OPCIONAL: transporte que nao tem o conceito
+   *  (Twilio/WABA e REST, nao ha presenca) simplesmente nao implementa, e
+   *  quem chama trata a ausencia — ver jobs/disparador.ts.
+   *
+   *  Nunca deve lancar por conta propria: presenca e cosmetica, e falhar
+   *  aqui nao pode impedir a mensagem de sair. */
+  sinalizarDigitando?(telefone: string, duracaoMs: number, waJidDestino?: string): Promise<void>;
+
   /** Registra o handler de mensagens recebidas. Um canal, um handler. */
   aoReceber(handler: (evento: EventoRecebido) => Promise<void>): void;
 }

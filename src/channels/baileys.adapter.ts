@@ -22,7 +22,6 @@ import { supabaseAdmin } from '../db/client.server.js';
 import { classificarConteudo, type RefDownload } from './mensagemWhatsApp.js';
 import { canalRecebeGrupos, sincronizarParticipantes } from '../services/grupos.js';
 import {
-  OperacaoNaoSuportadaError,
   type ChannelPort,
   type EnvioMensagem,
   type EventoRecebido,
@@ -647,10 +646,52 @@ export class BaileysChannel implements ChannelPort {
   aoReceber(handler: (evento: EventoRecebido) => Promise<void>): void {
     this.receiverHandler = handler;
   }
+
+  /**
+   * "digitando..." antes do envio (ChannelPort.sinalizarDigitando).
+   *
+   * Nao e disfarce: no WhatsApp o indicador de digitacao e parte da
+   * conversa, e uma mensagem longa que aparece instantaneamente e ruido de
+   * interface. Quem calcula a duracao e services/ritmoDisparo.ts, que tem
+   * piso e teto.
+   *
+   * Nunca lanca: presenca e cosmetica e nao pode impedir a mensagem.
+   */
+  async sinalizarDigitando(telefone: string, duracaoMs: number, waJidDestino?: string): Promise<void> {
+    if (!this.socket) return;
+    const jid = waJidDestino ?? `${telefone.replace(/\D/g, '')}@s.whatsapp.net`;
+    try {
+      await this.socket.presenceSubscribe(jid);
+      await this.socket.sendPresenceUpdate('composing', jid);
+      await new Promise((r) => setTimeout(r, Math.max(0, duracaoMs)));
+      await this.socket.sendPresenceUpdate('paused', jid);
+    } catch {
+      // Silencio proposital — ver doc do metodo.
+    }
+  }
 }
 
-/** Disparo em massa por Baileys é proibido (Risco #1). Guarda de código —
- *  o trigger `hub.impede_disparo_baileys` é a segunda camada, no banco. */
-export function bloquearDisparoEmMassa(): never {
-  throw new OperacaoNaoSuportadaError('baileys', 'disparo em massa (use um canal transporte=twilio)');
-}
+/* A GUARDA QUE EXISTIA AQUI
+ * -------------------------
+ * Ate 31/08/2026 este arquivo exportava `bloquearDisparoEmMassa()`, que
+ * recusava disparo em massa por Baileys, com o trigger
+ * `hub.impede_disparo_baileys` como segunda camada no banco.
+ *
+ * A campanha decidiu, por escrito, correr esse risco: ver §1.1 de
+ * docs/PLANO_CAMPANHA_INDIARA.md. Baileys e cliente nao oficial e volume
+ * atipico numa linha nova e o gatilho classico de ban — a decisao foi
+ * tomada com chip dedicado e chip reserva ja habilitado.
+ *
+ * As duas camadas nao viraram zero. No lugar entraram, na Fase 1,
+ * guarda-corpos de outra natureza — que protegem a PESSOA do outro lado em
+ * vez do numero da campanha:
+ *   · hub.impede_alvo_opt_out          (nunca enfileirar quem pediu para sair)
+ *   · hub.impede_disparo_sem_base_legal (base legal declarada por destinatario)
+ *   · hub.confere_teto_diario           (teto do dia conferido no banco)
+ * mais a reconferencia de opt-out NO INSTANTE do envio, em
+ * jobs/disparador.ts, e a janela/rampa/intervalo de
+ * services/ritmoDisparo.ts.
+ *
+ * Se algum dia esta plataforma voltar a ter um canal `twilio` para massa,
+ * a trava de transporte volta como ESCOLHA por canal, nao como proibicao
+ * global. */
