@@ -39,7 +39,17 @@ function maximoSegundos(): number {
 /** Desligável por env var, sem redeploy de código: é a válvula de escape se o
  *  custo por minuto de áudio surpreender (FA-10 do plano). */
 export function transcricaoAtiva(): boolean {
-  return process.env.TRANSCRICAO_ATIVA !== 'false' && !!process.env.GCP_PROJECT_ID;
+  return (
+    process.env.TRANSCRICAO_ATIVA !== 'false' &&
+    !!process.env.GCP_PROJECT_ID &&
+    // A mídia mudou para o Supabase Storage em 01/09/2026, e o caminho de
+    // lote do Speech-to-Text lê `gs://` — sem bucket no GCS não há o que
+    // transcrever. Sem esta segunda condição, um GCP_PROJECT_ID definido por
+    // outro motivo (Secret Manager, por exemplo) faria a transcrição tentar
+    // e estourar em midiaStorage.uriGs(). Ver
+    // docs/DEPLOY_CLOUDFLARE_RENDER_SUPABASE.md §0.4.
+    !!process.env.GCS_BUCKET_MIDIA
+  );
 }
 
 let _cliente: v2.SpeechClient | undefined;

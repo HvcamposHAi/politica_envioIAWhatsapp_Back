@@ -29,6 +29,7 @@
 import pino from 'pino';
 import { supabaseAdmin } from '../db/client.server.js';
 import { canaisRecuperaveis, canalEmMemoria, obterOuCriarCanal } from '../channels/registry.js';
+import { souODonoDoGateway } from './lease.js';
 
 const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL ?? 'warn' });
 
@@ -52,6 +53,17 @@ const EM_TRANSITO = new Set(['conectado', 'conectando', 'lendo_qr']);
  * afirmar.
  */
 export async function vigiarCanais(): Promise<number> {
+  // Só o dono da posse mexe em canal. Durante um deploy do Render existem
+  // duas instâncias por alguns segundos, e a que NÃO é dona reconectando
+  // sockets é o duelo de sessão que a posse existe para impedir — ver
+  // jobs/lease.ts.
+  //
+  // Este `return` também é o mecanismo de RETRY do boot: a instância nova
+  // não reconecta no boot (não é dona ainda); quando assume, o gancho da
+  // lease chama a reconexão, e daí em diante é este vigia que mantém tudo
+  // de pé.
+  if (!souODonoDoGateway()) return 0;
+
   let reconectados = 0;
   try {
     const ids = await canaisRecuperaveis();

@@ -131,6 +131,14 @@ vi.mock('../db/client.server.js', () => {
   return { supabaseAdmin: { from: (t: string) => new Consulta(t) } };
 });
 
+/** A posse do gateway (jobs/lease.ts) barra tudo que toca em canal quando
+ *  esta instância não é a dona. Aqui ela é controlável, para os testes
+ *  exercitarem os dois lados. */
+let temPosse = true;
+vi.mock('./lease.js', () => ({
+  souODonoDoGateway: () => temPosse,
+}));
+
 const enviarMock = vi.fn();
 const digitandoMock = vi.fn();
 
@@ -187,6 +195,7 @@ function clienteBase(over: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  temPosse = true;
   limparAgendamentos();
   religarDisparos();
   enviarMock.mockResolvedValue({ waMessageId: 'wa-1', status: 'enviada' });
@@ -329,5 +338,24 @@ describe('passadaDoDisparador', () => {
     // processo segura todas as linhas de WhatsApp.
     est.disparos = null as unknown as Record<string, unknown>[];
     await expect(passadaDoDisparador(AGORA)).resolves.toBeDefined();
+  });
+});
+
+describe('posse do gateway', () => {
+  it('NÃO envia quando esta instância não é a dona', async () => {
+    // Dois processos tirando alvos da mesma fila mandam a mesma mensagem
+    // duas vezes para a mesma pessoa. O índice único do banco barra a
+    // duplicata DEPOIS de a mensagem ter saído; esta guarda impede o envio.
+    temPosse = false;
+    const r = await passadaDoDisparador(AGORA);
+    expect(r.enviados).toBe(0);
+    expect(r.avaliados).toBe(0);
+    expect(enviarMock).not.toHaveBeenCalled();
+  });
+
+  it('envia normalmente quando a posse é desta instância', async () => {
+    temPosse = true;
+    const r = await passadaDoDisparador(AGORA);
+    expect(r.enviados).toBe(1);
   });
 });

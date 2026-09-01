@@ -156,6 +156,10 @@ mensagensRouter.get('/mensagens/:id/midia', async (req, res) => {
 
     const { url, expiraEm } = await urlAssinada(objeto, {
       nomeDownload: req.query.baixar === '1' ? (mensagem.midia_nome ?? undefined) : undefined,
+      // O tipo decide inline vs. attachment (midiaStorage.podeServirInline).
+      // Sem ele o default é attachment, e o player de áudio/vídeo do
+      // navegador para de funcionar.
+      tipoMime: mensagem.midia_tipo ?? undefined,
     });
     res.status(200).json({
       url,

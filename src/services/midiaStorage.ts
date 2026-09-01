@@ -1,35 +1,34 @@
-// Único módulo que conhece o bucket de mídia (GCS). Nada mais no repo deve
-// importar @google-cloud/storage — mesma disciplina de gcp/secretManager.ts.
+// Único módulo que conhece o bucket de mídia. Nada mais no repo deve falar
+// com o armazenamento direto.
 //
-// POR QUE GCS E NÃO SUPABASE STORAGE: o Speech-to-Text v2 lê `gs://` direto
-// no modo batch (áudio > 60s), então o objeto que já subimos vira a entrada
-// da transcrição sem cópia intermediária. Fora isso, a GCP já está
-// autenticada por ADC neste processo e o custo por GB é o que a empresa já
-// paga.
+// HISTÓRICO: até 01/09/2026 este arquivo usava Google Cloud Storage. A troca
+// de infraestrutura (Cloudflare + Render + Supabase) tirou a GCP da jogada, e
+// o Supabase Storage passou a ser o destino — mesmo projeto que já guarda o
+// banco, mesma credencial `service_role` que o backend já carrega, sem
+// nenhuma conta de nuvem a mais.
+//
+// A ASSINATURA PÚBLICA NÃO MUDOU. As sete funções exportadas continuam as
+// mesmas, com os mesmos parâmetros e retornos, porque seis lugares do código
+// dependem delas (routes/mensagens.ts, services/filaMidia.ts,
+// services/mensagens.ts, channels/twilio.adapter.ts). A troca é interna.
 //
 // POR QUE O BANCO GUARDA O CAMINHO, NUNCA A URL: URL assinada expira em
 // minutos. Gravada em coluna, ela apodrece e a mídia "some" depois de um dia
 // — a URL é gerada sob demanda por GET /mensagens/:id/midia, que revalida o
-// escopo do atendente a cada pedido.
+// escopo do atendente a cada pedido. Isso vale igual no Supabase.
 
-import { Storage } from '@google-cloud/storage';
+import { supabaseAdmin } from '../db/client.server.js';
 import type { Readable } from 'node:stream';
-
-let _storage: Storage | undefined;
-
-function storage(): Storage {
-  if (!_storage) _storage = new Storage();
-  return _storage;
-}
 
 /** Nome do bucket. Falha explícita e cedo, como o baseUrl() do front — um
  *  upload silenciosamente indo para "undefined" seria pior. */
 export function bucketNome(): string {
-  const nome = process.env.GCS_BUCKET_MIDIA;
+  const nome = process.env.SUPABASE_BUCKET_MIDIA;
   if (!nome) {
     throw new Error(
-      'GCS_BUCKET_MIDIA não configurado — necessário para guardar mídia do WhatsApp. ' +
-        'Ver PLANO_MENSAGENS_INTEGRA_WHATSAPP.md, passo 1 da infra.',
+      'SUPABASE_BUCKET_MIDIA não configurado — necessário para guardar mídia do WhatsApp. ' +
+        'Criar um bucket PRIVADO no Supabase Storage e apontar aqui. ' +
+        'Ver docs/DEPLOY_CLOUDFLARE_RENDER_SUPABASE.md §1.4.',
     );
   }
   return nome;
@@ -39,17 +38,29 @@ export function bucketNome(): string {
  *  fazer sem configuração (em dev local, a mensagem é gravada com
  *  midia_status='ignorada' em vez de o processo quebrar). */
 export function midiaConfigurada(): boolean {
-  return !!process.env.GCS_BUCKET_MIDIA;
+  return !!process.env.SUPABASE_BUCKET_MIDIA;
 }
 
 const TTL_PADRAO_SEG = Number(process.env.MIDIA_URL_TTL_SEGUNDOS ?? 600);
+
+/** Teto de bytes que aceitamos ler para a memória de uma vez. Mesmo valor que
+ *  o front e a rota de upload já batem. Ver a nota de memória em
+ *  subirStream(). */
+function tetoBytes(): number {
+  return Number(process.env.MIDIA_TAMANHO_MAX_MB ?? 16) * 1024 * 1024;
+}
+
+function bucket() {
+  return supabaseAdmin.storage.from(bucketNome());
+}
 
 /**
  * Caminho determinístico do objeto.
  *
  * Derivado do `wa_message_id`, que é a chave de idempotência do fluxo de
  * entrada: reentrega do Baileys depois de uma reconexão sobrescreve o MESMO
- * objeto em vez de criar lixo órfão no bucket.
+ * objeto em vez de criar lixo órfão no bucket. (Daí `upsert: true` nos
+ * uploads — sem ele o Supabase recusaria a segunda gravação com 409.)
  *
  * `sufixo` separa a miniatura do arquivo cheio.
  */
@@ -77,41 +88,76 @@ export interface OpcoesUpload {
   nomeArquivo?: string;
 }
 
-/** Sempre `attachment` para o que não é imagem/áudio/vídeo: um HTML ou SVG
- *  servido inline a partir de um domínio de storage é vetor de XSS. */
-function disposicao(o: OpcoesUpload): string {
-  const base = (o.tipoMime ?? '').split('/')[0];
-  const inline = base === 'image' || base === 'audio' || base === 'video';
-  const nome = (o.nomeArquivo ?? 'arquivo').replace(/["\\\r\n]/g, '');
-  return `${inline ? 'inline' : 'attachment'}; filename="${nome}"`;
+/**
+ * Este tipo pode ser servido INLINE pelo navegador com segurança?
+ *
+ * No GCS a decisão ia no `contentDisposition` do objeto, gravado no upload.
+ * O Supabase não deixa definir Content-Disposition por objeto — então a
+ * decisão migrou para a hora de gerar a URL (`download` em urlAssinada).
+ * Mesma regra, outro ponto de aplicação.
+ *
+ * SVG é imagem e NÃO entra: um SVG é um documento que executa script, e
+ * servi-lo inline a partir do domínio do storage é XSS. A versão anterior
+ * deste arquivo deixava passar, porque olhava só o `image/` do começo.
+ */
+function podeServirInline(tipoMime: string | undefined): boolean {
+  const mime = (tipoMime ?? '').toLowerCase();
+  if (mime === 'image/svg+xml' || mime.includes('svg')) return false;
+  const base = mime.split('/')[0];
+  return base === 'image' || base === 'audio' || base === 'video';
+}
+
+function limparNome(nome: string): string {
+  return nome.replace(/["\\\r\n]/g, '');
 }
 
 /**
- * Sobe um stream direto para o bucket, sem materializar o arquivo em memória.
+ * Sobe um stream para o bucket.
  *
- * É stream e não buffer de propósito: o hub-api é a instância ÚNICA que segura
- * os sockets do WhatsApp (registry.ts assume 1 instância). Bufferizar vídeos de
- * 16 MB em paralelo é o caminho mais curto para um OOM que mata TODAS as
- * linhas de uma vez, não só o download.
+ * ATENÇÃO — REGRESSÃO CONSCIENTE EM RELAÇÃO AO GCS. O cliente do GCS aceitava
+ * um `Readable` e escrevia direto, sem materializar o arquivo. O cliente de
+ * storage do Supabase não tem esse caminho: o corpo precisa ser um buffer.
+ *
+ * Então o stream é lido para a memória COM TETO. O teto é o mesmo
+ * `MIDIA_TAMANHO_MAX_MB` que a rota de upload e o front já aplicam (16 MB por
+ * padrão), e a fila roda com `MIDIA_CONCORRENCIA` 2 — o pior caso é ~32 MB
+ * transitórios, não um OOM. Estourar o teto aborta o download com erro
+ * explícito, que a fila registra como falha da mídia; a conversa segue.
+ *
+ * O motivo do cuidado continua o mesmo do texto original: este processo é a
+ * instância ÚNICA que segura os sockets do WhatsApp, e um OOM aqui mata TODAS
+ * as linhas de uma vez, não só o download.
  */
 export async function subirStream(
   caminho: string,
   origem: Readable,
   opcoes: OpcoesUpload,
 ): Promise<number> {
-  const arquivo = storage().bucket(bucketNome()).file(caminho);
+  const teto = tetoBytes();
+  const partes: Buffer[] = [];
+  let total = 0;
+
   await new Promise<void>((resolve, reject) => {
-    const destino = arquivo.createWriteStream({
-      resumable: false,
-      metadata: { contentType: opcoes.tipoMime, contentDisposition: disposicao(opcoes) },
+    origem.on('data', (pedaco: Buffer | string) => {
+      const b = Buffer.isBuffer(pedaco) ? pedaco : Buffer.from(pedaco);
+      total += b.length;
+      if (total > teto) {
+        origem.destroy();
+        reject(
+          new Error(
+            `mídia acima do teto de ${Math.round(teto / 1024 / 1024)} MB — download abortado ` +
+              '(MIDIA_TAMANHO_MAX_MB)',
+          ),
+        );
+        return;
+      }
+      partes.push(b);
     });
     origem.on('error', reject);
-    destino.on('error', reject);
-    destino.on('finish', resolve);
-    origem.pipe(destino);
+    origem.on('end', resolve);
   });
-  const [meta] = await arquivo.getMetadata();
-  return Number(meta.size ?? 0);
+
+  return subirBuffer(caminho, Buffer.concat(partes), opcoes);
 }
 
 export async function subirBuffer(
@@ -119,61 +165,89 @@ export async function subirBuffer(
   dados: Buffer,
   opcoes: OpcoesUpload,
 ): Promise<number> {
-  await storage()
-    .bucket(bucketNome())
-    .file(caminho)
-    .save(dados, {
-      resumable: false,
-      contentType: opcoes.tipoMime,
-      metadata: { contentDisposition: disposicao(opcoes) },
-    });
+  const { error } = await bucket().upload(caminho, dados, {
+    contentType: opcoes.tipoMime,
+    // Reentrega do Baileys grava o MESMO caminho (ver montarCaminho). Sem
+    // upsert, a segunda tentativa falharia com "Duplicate" e a mídia ficaria
+    // presa em 'pendente' para sempre.
+    upsert: true,
+  });
+  if (error) throw new Error(`falha ao subir mídia (${caminho}): ${error.message}`);
   return dados.length;
 }
 
 /**
- * URL assinada V4 de leitura.
+ * URL assinada de leitura.
  *
- * No Cloud Run a service account não tem chave privada local — a assinatura
- * passa pela API IAM SignBlob, e por isso a SA precisa de
- * `roles/iam.serviceAccountTokenCreator` SOBRE SI MESMA (passo 3 da infra).
- * Sem esse binding o erro é `Cannot sign data without client_email`, e ele só
- * aparece na primeira mídia que alguém tenta abrir em produção — daí o smoke
- * test específico no plano.
+ * Diferença em relação ao GCS, e é uma boa: não existe mais assinatura por
+ * IAM SignBlob, então some a exigência de a service account ter
+ * `roles/iam.serviceAccountTokenCreator` SOBRE SI MESMA — a pegadinha que
+ * quebrava a primeira mídia aberta em produção com "Cannot sign data without
+ * client_email". O Supabase assina com a própria service_role.
+ *
+ * `download` força Content-Disposition: attachment. É onde a proteção contra
+ * HTML/SVG servido inline passou a morar (ver podeServirInline).
  */
 export async function urlAssinada(
   caminho: string,
-  opcoes?: { ttlSeg?: number; nomeDownload?: string },
+  opcoes?: { ttlSeg?: number; nomeDownload?: string; tipoMime?: string },
 ): Promise<{ url: string; expiraEm: string }> {
   const ttl = Math.max(60, opcoes?.ttlSeg ?? TTL_PADRAO_SEG);
   const expiraEm = new Date(Date.now() + ttl * 1000);
-  const [url] = await storage()
-    .bucket(bucketNome())
-    .file(caminho)
-    .getSignedUrl({
-      version: 'v4',
-      action: 'read',
-      expires: expiraEm,
-      ...(opcoes?.nomeDownload
-        ? { responseDisposition: `attachment; filename="${opcoes.nomeDownload.replace(/["\\\r\n]/g, '')}"` }
-        : {}),
-    });
-  return { url, expiraEm: expiraEm.toISOString() };
+
+  // Sem tipo informado, o caminho seguro é forçar download. Quem sabe o tipo
+  // (routes/mensagens.ts lê midia_tipo da linha) passa e ganha o inline.
+  const forcarDownload = opcoes?.nomeDownload
+    ? limparNome(opcoes.nomeDownload)
+    : !podeServirInline(opcoes?.tipoMime)
+      ? true
+      : undefined;
+
+  const { data, error } = await bucket().createSignedUrl(
+    caminho,
+    ttl,
+    forcarDownload === undefined ? undefined : { download: forcarDownload },
+  );
+
+  if (error || !data?.signedUrl) {
+    throw new Error(`falha ao assinar URL de mídia (${caminho}): ${error?.message ?? 'sem URL'}`);
+  }
+  return { url: data.signedUrl, expiraEm: expiraEm.toISOString() };
 }
 
-/** Lê o objeto de volta para memória. Usado só pela transcrição de áudio
- *  CURTO (o `recognize` inline do Speech-to-Text precisa dos bytes, e nota de
- *  voz de 60s em opus tem ~120 KB). Não usar para vídeo — ver a nota de
+/** Lê o objeto de volta para memória. Não usar para vídeo — ver a nota de
  *  memória em subirStream(). */
 export async function baixarBuffer(caminho: string): Promise<Buffer> {
-  const [dados] = await storage().bucket(bucketNome()).file(caminho).download();
-  return dados;
+  const { data, error } = await bucket().download(caminho);
+  if (error || !data) {
+    throw new Error(`falha ao baixar mídia (${caminho}): ${error?.message ?? 'sem dados'}`);
+  }
+  return Buffer.from(await data.arrayBuffer());
 }
 
-/** URI `gs://` do objeto — entrada do batchRecognize do Speech-to-Text. */
+/**
+ * Existia para dar ao Speech-to-Text a URI `gs://` do objeto.
+ *
+ * Não há mais objeto no GCS. A transcrição em lote dependia disso e está
+ * desligada nesta infraestrutura — `transcricaoAtiva()` exige tanto
+ * `GCP_PROJECT_ID` quanto `GCS_BUCKET_MIDIA`, e nenhum dos dois existe aqui.
+ * A função continua exportada para o módulo de transcrição compilar; se ela
+ * for chamada de verdade, é bug de configuração e o erro diz qual.
+ */
 export function uriGs(caminho: string): string {
-  return `gs://${bucketNome()}/${caminho}`;
+  throw new Error(
+    `transcrição por URI gs:// não existe nesta infraestrutura (caminho: ${caminho}). ` +
+      'A mídia vive no Supabase Storage desde 01/09/2026. Se você chegou aqui, ' +
+      'GCP_PROJECT_ID e GCS_BUCKET_MIDIA foram definidos num ambiente sem GCS — ' +
+      'ver docs/DEPLOY_CLOUDFLARE_RENDER_SUPABASE.md §0.4.',
+  );
 }
 
+/** Remover objeto inexistente NÃO é erro: a limpeza roda depois de falha
+ *  parcial, onde metade dos caminhos pode nunca ter chegado ao bucket. */
 export async function apagar(caminho: string): Promise<void> {
-  await storage().bucket(bucketNome()).file(caminho).delete({ ignoreNotFound: true });
+  const { error } = await bucket().remove([caminho]);
+  if (error && !/not.?found/i.test(error.message)) {
+    throw new Error(`falha ao apagar mídia (${caminho}): ${error.message}`);
+  }
 }

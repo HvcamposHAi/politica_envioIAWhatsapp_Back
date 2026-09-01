@@ -1,16 +1,17 @@
 // O worker de disparo — Fase 3 do PLANO_CAMPANHA_INDIARA.md.
 //
 // POR QUE FILA EM PROCESSO, e não worker separado: este serviço já roda em
-// UMA instância permanente com CPU alocada (deploy.sh força
-// --min-instances=1 --max-instances=1 --no-cpu-throttling), porque ele
-// segura os WebSockets do WhatsApp. É exatamente o ambiente que uma fila
-// precisa, e é o mesmo processo que tem o socket na mão — mandar por outro
-// processo exigiria um protocolo entre os dois para nada.
+// UMA instância permanente e sempre acordada (render.yaml: plan starter,
+// numInstances 1), porque ele segura os WebSockets do WhatsApp. É
+// exatamente o ambiente que uma fila precisa, e é o mesmo processo que tem
+// o socket na mão — mandar por outro processo exigiria um protocolo entre
+// os dois para nada.
 //
-// A contrapartida é que `--max-instances=1` deixa de ser só anti-duelo-de-
-// sessão e passa a ser anti-envio-duplicado. O índice único
-// (disparo_id, telefone) e o trigger de teto no banco são a segunda camada,
-// para o dia em que alguém mexer nessa flag.
+// "Uma instância" NÃO é garantido pela configuração do Render: o deploy
+// sobrepõe a nova com a velha por alguns segundos. Quem garante é a posse
+// do gateway (jobs/lease.ts), consultada na primeira linha da passada. O
+// índice único (disparo_id, telefone) e o trigger de teto no banco são a
+// terceira camada, para o dia em que alguém mexer nisso.
 //
 // O QUE ESTE JOB NUNCA FAZ:
 //   · não envia fora da janela horária;
@@ -25,6 +26,7 @@
 import pino from 'pino';
 import { supabaseAdmin } from '../db/client.server.js';
 import { canalEmMemoria, obterOuCriarCanal } from '../channels/registry.js';
+import { souODonoDoGateway } from './lease.js';
 import {
   aplicarCampos,
   avaliarPausaAutomatica,
@@ -160,6 +162,11 @@ export interface ResultadoPassada {
 export async function passadaDoDisparador(agora = new Date()): Promise<ResultadoPassada> {
   const resultado: ResultadoPassada = { avaliados: 0, enviados: 0, pulados: {}, pausados: 0 };
   if (!interruptorGeral) return resultado;
+  // Dois processos tirando alvos da mesma fila mandariam a mesma mensagem
+  // duas vezes para a mesma pessoa. O índice único (disparo_id, telefone)
+  // barra a duplicata no banco, mas só DEPOIS de a mensagem ter saído —
+  // esta guarda é a que impede o envio. Ver jobs/lease.ts.
+  if (!souODonoDoGateway()) return resultado;
 
   try {
     const { data: disparos, error } = await supabaseAdmin

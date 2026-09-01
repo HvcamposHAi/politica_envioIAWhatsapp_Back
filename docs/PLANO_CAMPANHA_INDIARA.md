@@ -398,7 +398,7 @@ Inclui identidade visual, favicon, título e textos da tela de login.
 | IA inventar promessa | Média | Prompt fechado + validador determinístico + revisão de amostra obrigatória. |
 | Custo de IA | Média | Pré-geração em lote; Sonnet na personalização, Opus só no painel analítico; estimar custo por mil antes de liberar. |
 | Prazo | Alta | Fases 0–3 entregam disparo com merge simples de campos; IA é segunda onda. |
-| Queda do Cloud Run | Baixa | `deploy.sh` já cobre (`min=max=1`, sem throttling); o worker é idempotente. |
+| Queda ou deploy do backend | Baixa | `render.yaml` cobre plano pago e instância única; a posse do gateway (`jobs/lease.ts`) cobre a sobreposição do deploy, que a configuração sozinha não resolve. O worker é idempotente. |
 
 ---
 

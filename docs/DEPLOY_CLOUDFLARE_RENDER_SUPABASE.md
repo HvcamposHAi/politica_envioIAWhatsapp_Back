@@ -24,10 +24,23 @@ sem as contas criadas.
 
 ---
 
-## Parte 0 — Mudanças de código, ANTES de provisionar qualquer coisa
+## Parte 0 — Mudanças de código  ✅ FEITAS EM 01/09/2026
 
-Provisionar primeiro e descobrir isto depois custa um dia. São quatro itens;
-três exigem código.
+> **Esta parte já está aplicada e commitada.** Ficou escrita porque explica
+> *por que* cada peça é como é — o próximo a mexer precisa disso. Quem só
+> vai provisionar pode pular direto para a Parte 1.
+>
+> | | Item | Estado |
+> | --- | --- | --- |
+> | 0.1 | Preset do Nitro → `cloudflare-module` | feito, build verificado |
+> | 0.2 | Mídia → Supabase Storage | feito, `midiaStorage.ts` reescrito |
+> | 0.3 | Posse do gateway | feito, migration + `jobs/lease.ts` + 14 testes |
+> | 0.4 | Transcrição | fechada por duas condições, não uma |
+> | 0.5 | `DATABASE_URL` removida do `.env.example` | feito |
+> | 0.6 | `deploy.sh` e `cloudbuild.yaml` → `render.yaml` | feito, apagados |
+>
+> Verificado: 606 testes no backend, 218 no front, `tsc` limpo, os dois
+> builds passando. **Nada aplicado em banco nem publicado.**
 
 ### 0.1 Front: preset do Nitro *(verificado)*
 

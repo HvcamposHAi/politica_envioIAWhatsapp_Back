@@ -1,0 +1,128 @@
+# Infraestrutura do backend como código — substitui deploy.sh (gcloud).
+#
+# ---------------------------------------------------------------------
+# POR QUE ESTE ARQUIVO EXISTE
+# ---------------------------------------------------------------------
+# O deploy.sh que ele substitui foi escrito depois de um diagnóstico de
+# quedas periódicas, e explicava que três flags do Cloud Run não eram
+# otimização e sim PRÉ-REQUISITO de funcionamento. As três razões continuam
+# valendo no Render, com outros nomes:
+#
+#   min-instances=1     -> plan: starter (o plano gratuito SUSPENDE por
+#                          inatividade, e suspender é derrubar todas as
+#                          linhas de WhatsApp sem ninguém perceber)
+#   max-instances=1     -> numInstances: 1 + autoscaling desligado
+#   no-cpu-throttling   -> o Render não faz throttling entre requisições;
+#                          nada a configurar
+#
+# O que o Render acrescenta e o Cloud Run não tinha: o deploy sobrepõe as
+# instâncias. `numInstances: 1` NÃO impede duas instâncias durante a
+# publicação. Quem impede é a posse do gateway (src/jobs/lease.ts) — não é
+# configuração, é código, e sem ela todo deploy arrisca um duelo de sessão.
+# Ver docs/DEPLOY_CLOUDFLARE_RENDER_SUPABASE.md §0.3.
+# ---------------------------------------------------------------------
+
+services:
+  - type: web
+    name: central-indiara-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+
+    # Docker e não runtime Node nativo: o Dockerfile instala ffmpeg, que
+    # NÃO é opcional. Sem ele a nota de voz gravada no navegador (webm/opus)
+    # não é convertida, o sistema diz "enviado", e boa parte dos Androids do
+    # outro lado mostra um anexo que não toca (ver services/audioVoz.ts).
+
+    # O Render não tem região no Brasil. `oregon` é o default; troque pela
+    # mais próxima disponível e ponha o projeto Supabase na MESMA região —
+    # toda leitura é uma chamada HTTP, e continentes diferentes somam
+    # latência em cada uma delas.
+    region: oregon
+
+    # NÃO use `free`: ele suspende por inatividade. Este serviço segura os
+    # WebSockets do WhatsApp em memória.
+    plan: starter
+
+    numInstances: 1
+
+    healthCheckPath: /health
+
+    # Deploy automático é conveniente, mas cada publicação passa pela janela
+    # de sobreposição. Enquanto quiser conferir cada uma à mão, deixe false
+    # e publique manualmente em horário de baixo movimento.
+    autoDeploy: false
+
+    envVars:
+      # ---- Supabase -------------------------------------------------
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      # Ignora RLS e lê tudo. Nunca sai daqui para o front.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+      # ---- IA -------------------------------------------------------
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
+      # ---- Mídia ----------------------------------------------------
+      # Bucket PRIVADO do Supabase Storage.
+      - key: SUPABASE_BUCKET_MIDIA
+        value: midia
+      - key: MIDIA_TAMANHO_MAX_MB
+        value: "16"
+      - key: MIDIA_URL_TTL_SEGUNDOS
+        value: "600"
+      - key: MIDIA_CONCORRENCIA
+        value: "2"
+
+      # ---- Ritmo do disparo -----------------------------------------
+      # Tetos do ambiente. O que o admin configura por campanha vive em
+      # hub.disparos; isto aqui é o limite duro.
+      - key: DISPARO_JANELA_INICIO
+        value: "09:00"
+      - key: DISPARO_JANELA_FIM
+        value: "20:00"
+      - key: DISPARO_INTERVALO_MIN_SEG
+        value: "25"
+      - key: DISPARO_INTERVALO_MAX_SEG
+        value: "90"
+      - key: DISPARO_RAMPA
+        value: 40,80,150,250,400
+      - key: DISPARO_LIMIAR_FALHA_PCT
+        value: "15"
+      - key: DISPARO_LIMIAR_OPTOUT_PCT
+        value: "5"
+      # FALSO NO PRIMEIRO DEPLOY, de propósito. O worker sobe e não faz
+      # nada. Ligar depois de conferir a linha conectada e de passar no
+      # teste de responder "SAIR" é muito mais barato que descobrir um
+      # problema com mensagem já saindo.
+      - key: DISPARO_ATIVO
+        value: "false"
+
+      # ---- Posse do gateway -----------------------------------------
+      - key: GATEWAY_LEASE_TTL_SEG
+        value: "45"
+      - key: GATEWAY_LEASE_RENOVACAO_MS
+        value: "15000"
+
+      # ---- HTTP -----------------------------------------------------
+      # Preencher com a URL do Worker no Cloudflare depois que ele existir.
+      # Sem CORS_ORIGIN, toda chamada do navegador morre em CORS; sem
+      # APP_BASE_URL, o link de convite aponta para localhost.
+      - key: CORS_ORIGIN
+        sync: false
+      - key: APP_BASE_URL
+        sync: false
+
+      # ---- Transcrição ----------------------------------------------
+      # Desligada: dependia do Speech-to-Text lendo gs:// do bucket, e não
+      # há mais bucket no GCS. transcricaoAtiva() já devolve false sozinha
+      # sem GCP_PROJECT_ID e GCS_BUCKET_MIDIA — isto é só explícito.
+      - key: TRANSCRICAO_ATIVA
+        value: "false"
+
+      # GCP_PROJECT_ID fica DE FORA de propósito. Defini-la liga o caminho
+      # do Secret Manager e desliga a leitura das credenciais Twilio por
+      # variável de ambiente.

@@ -109,7 +109,10 @@ export class TwilioChannel implements ChannelPort {
       let mediaUrl: string[] | undefined;
       if (msg.midiaObjeto) {
         const { urlAssinada } = await import('../services/midiaStorage.js');
-        const { url } = await urlAssinada(msg.midiaObjeto, { ttlSeg: 600 });
+        const { url } = await urlAssinada(msg.midiaObjeto, {
+          ttlSeg: 600,
+          tipoMime: msg.midiaTipo,
+        });
         mediaUrl = [url];
       } else if (msg.midiaUrl) {
         mediaUrl = [msg.midiaUrl];

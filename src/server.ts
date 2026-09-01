@@ -43,6 +43,7 @@ import { iniciarVarreduraMidia } from './services/filaMidia.js';
 import { iniciarVigiaDeCanais } from './jobs/vigiaCanais.js';
 import { iniciarVigiaSemDono } from './jobs/vigiaSemDono.js';
 import { iniciarDisparador } from './jobs/disparador.js';
+import { iniciarLease, liberarLease } from './jobs/lease.js';
 
 const PORT = Number(process.env.PORT ?? 8081);
 
@@ -120,13 +121,24 @@ const server = app.listen(PORT, () => {
   console.log(`agrotimbo_hubwhatsapp_bkend ouvindo na porta ${PORT}`);
 });
 
-// Reconecta os canais Baileys que estavam ativos antes deste processo
-// subir (incidente 2026-08-07: sem isto, todo restart do Cloud Run — um
-// deploy normal incluído — parava de receber mensagens até alguém notar
-// e reconectar manualmente). Fire-and-forget: /health fica de pé mesmo
-// enquanto as linhas ainda estão reconectando, e uma falha aqui não deve
-// derrubar o boot do servidor HTTP.
-void reconectarCanaisAoSubir();
+// POSSE DO GATEWAY, antes de qualquer coisa que toque em canal.
+//
+// A reconexão de boot NÃO roda mais direto aqui. Ela virou o gancho de
+// "assumi a posse", e a diferença é o ponto inteiro desta mudança: no
+// Render a instância nova sobe e passa no health check ANTES de a velha
+// receber SIGTERM. Reconectar no boot, nessa janela, é abrir uma segunda
+// sessão Baileys na mesma identidade — o WhatsApp derruba as duas com
+// `440 connectionReplaced` e elas entram em duelo de reconexão.
+//
+// Com a posse: a instância nova sobe, serve /health, e fica esperando. A
+// velha libera no SIGTERM, a nova assume em segundos e só então reconecta.
+// Ver jobs/lease.ts e a migration 20260901120000_gateway_lease.sql.
+//
+// Fire-and-forget mantido: /health responde mesmo enquanto as linhas ainda
+// estão reconectando, e uma falha aqui não derruba o servidor HTTP.
+iniciarLease(() => {
+  void reconectarCanaisAoSubir();
+});
 
 // Rede de segurança da fila de mídia, que é em memória por design: todo
 // deploy do Cloud Run é um restart, e um download interrompido no meio
@@ -161,6 +173,11 @@ iniciarDisparador();
 async function desligarComCalma(sinal: string) {
   // eslint-disable-next-line no-console
   console.log(`${sinal} recebido, desconectando canais antes de sair...`);
+  // Entregar a posse PRIMEIRO: enquanto ela for nossa, a instância nova
+  // fica esperando de braços cruzados. Liberar antes de desconectar reduz
+  // a janela sem ninguém escutando de 45s (o prazo da posse) para o tempo
+  // do próprio shutdown.
+  await liberarLease();
   await desconectarTodosOsCanais();
   server.close(() => process.exit(0));
   // Timeout de segurança: não travar o deploy esperando indefinidamente.

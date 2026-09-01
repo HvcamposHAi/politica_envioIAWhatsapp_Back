@@ -15,6 +15,14 @@ const canalEmMemoriaMock = vi.fn();
 const conectarSpy = vi.fn().mockResolvedValue(undefined);
 const obterOuCriarCanalMock = vi.fn(async () => ({ conectar: conectarSpy }));
 
+/** A posse do gateway (jobs/lease.ts) barra tudo que toca em canal quando
+ *  esta instância não é a dona. Aqui ela é controlável, para os testes
+ *  exercitarem os dois lados. */
+let temPosse = true;
+vi.mock('./lease.js', () => ({
+  souODonoDoGateway: () => temPosse,
+}));
+
 vi.mock('../channels/registry.js', () => ({
   canaisRecuperaveis: (...a: unknown[]) => canaisRecuperaveisMock(...a),
   canalEmMemoria: (...a: unknown[]) => canalEmMemoriaMock(...a),
@@ -39,6 +47,7 @@ const { vigiarCanais } = await import('./vigiaCanais.js');
 const emMemoria = (status: string) => ({ status: vi.fn().mockResolvedValue(status) });
 
 beforeEach(() => {
+  temPosse = true;
   insercoes.length = 0;
   conectarSpy.mockClear();
   obterOuCriarCanalMock.mockClear();
@@ -122,5 +131,38 @@ describe('vigiarCanais() — nunca lança', () => {
 
     await expect(vigiarCanais()).resolves.toBe(1);
     expect(conectarSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('posse do gateway', () => {
+  it('NÃO mexe em canal nenhum quando esta instância não é a dona', async () => {
+    // Durante um deploy do Render existem duas instâncias por alguns
+    // segundos. A que não tem a posse reconectando sockets é exatamente o
+    // duelo de sessão (440 connectionReplaced) que a posse existe para
+    // impedir.
+    temPosse = false;
+    canaisRecuperaveisMock.mockResolvedValue(['c1']);
+    canalEmMemoriaMock.mockReturnValue(undefined);
+
+    const reconectados = await vigiarCanais();
+
+    expect(reconectados).toBe(0);
+    expect(canaisRecuperaveisMock).not.toHaveBeenCalled();
+    expect(obterOuCriarCanalMock).not.toHaveBeenCalled();
+    expect(conectarSpy).not.toHaveBeenCalled();
+  });
+
+  it('volta a trabalhar assim que a posse é reavida', async () => {
+    // O vigia é o mecanismo de RETRY: a instância nova não reconecta no
+    // boot (não é dona ainda) e, quando assume, é aqui que tudo volta.
+    temPosse = false;
+    canaisRecuperaveisMock.mockResolvedValue(['c1']);
+    canalEmMemoriaMock.mockReturnValue(undefined);
+    await vigiarCanais();
+    expect(conectarSpy).not.toHaveBeenCalled();
+
+    temPosse = true;
+    await vigiarCanais();
+    expect(conectarSpy).toHaveBeenCalled();
   });
 });
