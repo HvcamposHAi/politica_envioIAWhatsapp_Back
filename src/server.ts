@@ -15,7 +15,9 @@
 //     (routes/resumo.ts, regeneração manual). Ver plano "Resumo de IA no
 //     Kanban de Chamados".
 //   · jobs/ (campanhas, reengajamento, health-check) (Fase 8)
-//   · /conversas/:id/transferir, /disparos
+//   · /conversas/:id/transferir
+//   · /disparos + worker de fila (Fase 3 do PLANO_CAMPANHA_INDIARA.md).
+//     A importação de eleitores (Fase 2) JÁ existe: routes/importacao.ts.
 
 import express from 'express';
 import helmet from 'helmet';
@@ -31,6 +33,7 @@ import { resumoRouter } from './routes/resumo.js';
 import { atendentesRouter } from './routes/atendentes.js';
 import { contaRouter } from './routes/conta.js';
 import { configuracoesRouter } from './routes/configuracoes.js';
+import { importacaoRouter } from './routes/importacao.js';
 import { twilioWebhookRouter } from './webhooks/twilio.js';
 import { desconectarTodosOsCanais, reconectarCanaisAoSubir } from './channels/registry.js';
 import { iniciarVarreduraMidia } from './services/filaMidia.js';
@@ -105,6 +108,7 @@ app.use(resumoRouter);
 app.use(atendentesRouter);
 app.use(contaRouter);
 app.use(configuracoesRouter);
+app.use(importacaoRouter);
 
 const server = app.listen(PORT, () => {
   // eslint-disable-next-line no-console
