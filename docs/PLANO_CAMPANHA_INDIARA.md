@@ -12,6 +12,29 @@ Decisões do cliente que definem este plano (colhidas em 31/08):
 
 ---
 
+## Estado da execução (01/09/2026)
+
+| Fase | Estado | Onde está |
+| --- | --- | --- |
+| 0 — Descolar do cliente anterior | **feito** | commit `Fase 0` nos dois repos |
+| 1 — Modelo de dados eleitoral | **feito** (migration escrita, **não aplicada**) | `supabase/migrations/20260831120000_campanha_eleitores.sql` |
+| 2 — Importador XLSX/CSV | **feito** | `services/importador.ts`, `routes/importacao.ts`, `/eleitores` |
+| 3 — Motor de disparo | **feito** | `services/ritmoDisparo.ts`, `jobs/disparador.ts`, `routes/disparos.ts`, `/disparos` |
+| — Descadastro por resposta | **feito** | `services/optOut.ts` (buraco encontrado depois da Fase 3) |
+| 4.1 — Personalização por IA | **feito** | `services/personalizacaoIA.ts` + trava de amostra |
+| 4.2 — Resposta automática 1:1 | a fazer | precisa da base de conhecimento da campanha |
+| 4.3 — Triagem de respostas | a fazer | adapta `services/analiseIA.ts` |
+| 4.4 — Analista no painel | a fazer | adapta `services/aliceFoco.ts` |
+| 5 — Painel da campanha | a fazer | adapta `_authenticated.painel.tsx` |
+| 6 — Vocabulário e identidade | a fazer | renomeação mecânica, de uma vez |
+
+**Nada foi aplicado nem publicado.** Não há projeto Supabase da campanha, não
+há projeto GCP, não há linha de WhatsApp conectada. Tudo abaixo está
+verificado por teste automatizado e por `tsc`, e nada foi verificado contra
+um Postgres real ou um número real — ver "O que depende de decisão humana".
+
+---
+
 ## 0. Ponto de partida — o que realmente está aqui
 
 Os dois repositórios (`politica_envioIAWhatsapp_Back` e `_Front`) são uma
