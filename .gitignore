@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+
+# Segredos reais nunca versionados. .env.example é o modelo.
+.env
+.env.*
+!.env.example
+
+# Cache local do Supabase CLI (project-ref, pooler-url, versões).
+supabase/.temp/
