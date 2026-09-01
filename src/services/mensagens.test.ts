@@ -163,7 +163,10 @@ vi.mock('../db/client.server.js', () => ({
 
 /** O fluxo de descadastro responde a confirmacao pelo canal. Sem este mock,
  *  o teste tentaria abrir um socket de WhatsApp de verdade. */
-const enviarMock = vi.fn(async () => ({ waMessageId: 'wa-confirma', status: 'enviada' as const }));
+const enviarMock = vi.fn(async (_msg: { texto?: string; telefone: string }) => ({
+  waMessageId: 'wa-confirma',
+  status: 'enviada' as const,
+}));
 vi.mock('../channels/registry.js', () => ({
   obterOuCriarCanal: async () => ({ enviar: enviarMock }),
 }));
