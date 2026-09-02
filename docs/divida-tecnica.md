@@ -28,23 +28,18 @@ reimplementar. Uma fonte só.
 
 ---
 
-## 2026-08-31 — `types.ts` do front ainda descreve o schema antigo
+## 2026-08-31 — `types.ts` do front descrevia o schema antigo — RESOLVIDO em 02/09
 
-**O que é:** `politica_envioIAWhatsapp_Front/src/integrations/supabase/types.ts`
-é gerado por `supabase gen types --schema hub` e ainda contém as views e
-colunas de ponte com o ERP que a Fase 0 removeu das migrations
-(`v_cliente_ficha`, `v_cliente_inativo`, `cod_cliente`, `cod_vendedor`,
-`cod_filial`).
+Estava aqui porque o arquivo gerado ainda continha as views e colunas de
+ponte com o ERP que a Fase 0 removeu, e só podia ser regenerado contra um
+banco de verdade.
 
-**Por que existe:** o arquivo só pode ser regenerado contra um banco de
-verdade, e o projeto Supabase da campanha ainda não foi criado (é um dos
-gates humanos da Fase 0). Editá-lo à mão seria pior: ele é gerado, e a
-edição manual seria sobrescrita na primeira regeneração, provavelmente
-sem ninguém notar.
+Resolvido: com o schema aplicado no `Projetos_HAI`,
+`supabase gen types typescript --linked --schema hub` regerou o arquivo —
+1.698 linhas, as 14 referências ao ERP zeradas, e as tabelas novas
+(`gateway_lease`, `importacoes`, `listas`, `lista_eleitores`) presentes.
+Build e 218 testes do front passando depois da troca.
 
-**Impacto hoje:** nenhum em runtime — nada em `src/` lê essas views;
-conferido por busca em 31/08. É só tipo morto.
-
-**Quando resolver:** assim que o projeto Supabase da campanha existir e as
-migrations forem aplicadas. Rodar `supabase gen types --schema hub` e
-commitar o resultado. Item de aceite da Fase 1.
+**Fica o hábito:** toda vez que uma migration nova for aplicada, regerar.
+O `--schema hub` não é opcional — sem ele, os tipos do CRM que divide o
+projeto entrariam no código do front.
