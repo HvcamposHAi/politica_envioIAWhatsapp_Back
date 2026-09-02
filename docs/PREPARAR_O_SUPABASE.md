@@ -105,15 +105,56 @@ as nossas 31 só na coluna `Local`.
 
 ## Passo 3 — Aplicar as 31 migrations
 
-```bash
-cd politica_envioIAWhatsapp_Back
-supabase db push
-```
+> ### ⛔ `supabase db push` NÃO funciona neste projeto
+>
+> Tentei em 02/09/2026 e o CLI recusa:
+>
+> ```
+> Remote migration versions not found in local migrations directory.
+> ```
+>
+> **Por quê:** a tabela de histórico de migrations
+> (`supabase_migrations.schema_migrations`) é **única por projeto**. Ela já
+> tem as 18 migrations do CRM, que não existem no nosso repositório. Dois
+> repositórios não podem os dois usar `db push` no mesmo projeto.
+>
+> **As duas saídas que o próprio CLI sugere danificam o CRM. Não use:**
+>
+> | Sugestão do CLI | O que faz de verdade |
+> | --- | --- |
+> | `supabase migration repair --status reverted ...` | Apaga do histórico as 18 migrations **do CRM**. O schema dele continua de pé, mas a ferramenta dele passa a achar que nada foi aplicado. |
+> | `supabase db pull` | Despeja o schema inteiro do CRM dentro das **nossas** migrations. |
 
-Ele lista as 31 e pede confirmação.
+### O caminho que funciona
 
-**Deu certo quando** aparece `Finished supabase db push.` e, no meio da
-saída, várias linhas de `NOTICE` com `=== OK: ... ===`.
+Use o arquivo consolidado, que aplica o nosso schema **sem escrever uma
+linha no histórico** — o CRM não percebe que existimos:
+
+1. Abra `supabase/manual/aplicar_central_no_projeto_compartilhado.sql`
+   (241 KB, gerado a partir das 31 migrations).
+2. Copie **inteiro**.
+3. Supabase → **SQL Editor** → **New query** → colar → **Run**.
+
+**É tudo ou nada.** Os `begin`/`commit` de cada migration foram removidos
+de propósito, para o SQL Editor rodar o conjunto numa transação só. Se
+qualquer verificação reprovar, **nada** é aplicado e o banco fica
+exatamente como estava.
+
+Para regerar depois de criar uma migration nova, veja o cabeçalho do
+próprio arquivo.
+
+> ### 💸 O custo, registrado
+>
+> Enquanto a Central viver neste projeto, **`supabase db push` não volta a
+> funcionar aqui**. Toda migration futura entra pelo mesmo caminho manual —
+> e ainda vêm migrations nas Fases 4.2 a 6.
+>
+> Um projeto Supabase separado custa 5 minutos e devolve o `db push`,
+> além de resolver o compartilhamento da `service_role` e o limite de
+> Storage. É a recomendação; a decisão é sua.
+
+**Deu certo quando** aparecem, no painel de resultado, várias linhas de
+`NOTICE` com `=== OK: ... ===`.
 
 > ### Esses `NOTICE` não são enfeite
 >
