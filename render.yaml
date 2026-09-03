@@ -8,9 +8,12 @@
 # otimização e sim PRÉ-REQUISITO de funcionamento. As três razões continuam
 # valendo no Render, com outros nomes:
 #
-#   min-instances=1     -> plan: starter (o plano gratuito SUSPENDE por
-#                          inatividade, e suspender é derrubar todas as
-#                          linhas de WhatsApp sem ninguém perceber)
+#   min-instances=1     -> plan pago (o gratuito SUSPENDE por inatividade,
+#                          e suspender é derrubar todas as linhas de
+#                          WhatsApp sem ninguém perceber). Hoje está em
+#                          `free` de propósito, para validar o deploy —
+#                          ver o bloco do `plan` abaixo, com o gatilho de
+#                          troca.
 #   max-instances=1     -> numInstances: 1 + autoscaling desligado
 #   no-cpu-throttling   -> o Render não faz throttling entre requisições;
 #                          nada a configurar
@@ -39,9 +42,34 @@ services:
     # latência em cada uma delas.
     region: oregon
 
-    # NÃO use `free`: ele suspende por inatividade. Este serviço segura os
-    # WebSockets do WhatsApp em memória.
-    plan: starter
+    # ⚠️  GRATUITO — ESCOLHA CONSCIENTE, COM PRAZO DE VALIDADE (02/09/2026)
+    #
+    # O plano `free` do Render SUSPENDE o serviço depois de ~15 minutos sem
+    # requisição HTTP. Para ESTE backend, isso quebra três coisas:
+    #
+    #   1. As linhas de WhatsApp caem. Os sockets vivem na memória do
+    #      processo; suspender é desconectar todas.
+    #   2. Nada acorda o serviço sozinho. Ele volta com uma requisição
+    #      HTTP — e mensagem de WhatsApp que chega NÃO é uma: é um
+    #      WebSocket que o processo abre. A linha fica fora do ar até
+    #      alguém abrir o painel.
+    #   3. O worker de disparo para. É setInterval: processo suspenso,
+    #      campanha parada no meio, sem aviso nenhum.
+    #
+    # Ou seja: no gratuito o sistema funciona enquanto alguém está com a
+    # aba aberta, e para poucos minutos depois de fechar.
+    #
+    # POR QUE ENTÃO ESTÁ `free` AQUI: é suficiente para subir, conferir
+    # /health, fazer login, ler o QR e mandar uma mensagem de teste — tudo
+    # com alguém olhando a tela. Serve para validar o deploy.
+    #
+    # TROQUE PARA `starter` ANTES de qualquer uma destas duas coisas:
+    #   · deixar a linha conectada esperando eleitor fora do horário;
+    #   · ligar DISPARO_ATIVO=true.
+    #
+    # É a mesma razão pela qual a infraestrutura anterior exigia instância
+    # sempre acordada — não era otimização de custo.
+    plan: free
 
     numInstances: 1
 
