@@ -22,12 +22,47 @@ import { supabaseAdmin } from '../db/client.server.js';
 import { classificarConteudo, type RefDownload } from './mensagemWhatsApp.js';
 import { canalRecebeGrupos, sincronizarParticipantes } from '../services/grupos.js';
 import {
+  type AckEntrega,
   type ChannelPort,
   type EnvioMensagem,
   type EventoRecebido,
   type ResultadoEnvio,
   type StatusConexao,
 } from './port.js';
+
+/**
+ * Quanto tempo depois de `connection: 'open'` a linha pode receber
+ * disparo em massa (estágio 2 da mecânica — ver prontoParaCampanha).
+ *
+ * O socket abre antes de a sessão estar utilizável, e a reconexão
+ * automática é exatamente quando o worker acorda com a fila cheia.
+ */
+const AQUECIMENTO_CAMPANHA_MS = 60_000;
+
+/**
+ * Tamanho do lote do pré-voo (`onWhatsApp`).
+ *
+ * Pequeno de propósito: consultar milhares de números de uma vez, numa
+ * linha nova, é o mesmo padrão que a rampa de aquecimento existe para
+ * evitar. O resultado é gravado em hub.clientes.wa_jid e nunca
+ * reconsultado, então este custo é pago uma vez por eleitor.
+ */
+const LOTE_PRE_VOO = 20;
+const PAUSA_ENTRE_LOTES_MS = 1_500;
+
+/** Ack do WhatsApp -> vocabulário de hub.mensagens.status_entrega.
+ *
+ *  2 = servidor recebeu, 3 = aparelho recebeu, 4 = pessoa leu. 5 é
+ *  "played" (áudio ouvido), que para efeito de entrega é o mesmo que
+ *  lido. Ack negativo (-1) é erro de entrega definitivo. */
+function ackParaStatus(ack: number | null | undefined): AckEntrega['status'] | null {
+  if (ack === null || ack === undefined) return null;
+  if (ack < 0) return 'falhou';
+  if (ack >= 4) return 'lida';
+  if (ack === 3) return 'entregue';
+  if (ack === 2) return 'enviada';
+  return null;
+}
 
 const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL ?? 'warn' });
 
@@ -117,7 +152,13 @@ export class BaileysChannel implements ChannelPort {
   readonly transporte = 'baileys' as const;
   private socket: WASocket | undefined;
   private receiverHandler: ((evento: EventoRecebido) => Promise<void>) | undefined;
+  /** Handler de confirmação de entrega (ack). Ver aoConfirmarEntrega. */
+  private ackHandler: ((ack: AckEntrega) => Promise<void>) | undefined;
   private statusAtual: StatusConexao = 'desconectado';
+  /** Quando o socket atual abriu (`connection: 'open'`). Base do
+   *  aquecimento de campanha — ver prontoParaCampanha(). Zerado a cada
+   *  queda, porque a reconexão recomeça a contagem. */
+  private conectadoDesde = 0;
   /** Zerado a cada conexão bem-sucedida; dobra a cada queda que reconecta. */
   private tentativasReconexao = 0;
   /** true durante um desconectar() em andamento — suprime o auto-reconnect
@@ -248,6 +289,10 @@ export class BaileysChannel implements ChannelPort {
       if (connection === 'open') {
         this.statusAtual = 'conectado';
         this.tentativasReconexao = 0;
+        // Marca o início do aquecimento. Toda reconexão recomeça a
+        // contagem, de propósito: o disparo não pode voltar a mandar no
+        // mesmo segundo em que o socket voltou (estágio 2).
+        this.conectadoDesde = Date.now();
         await atualizarStatusCanal(this.canalId, 'conectado');
         await registrarEvento(this.canalId, 'conectado');
       }
@@ -357,6 +402,58 @@ export class BaileysChannel implements ChannelPort {
               err: err instanceof Error ? err.message : String(err),
             },
             'falha ao processar mensagem recebida no adapter — seguindo para a próxima',
+          );
+        }
+      }
+    });
+
+    /* CONFIRMAÇÃO DE ENTREGA (ack) — estágio 5 da mecânica de disparo.
+     *
+     * Este handler NÃO EXISTIA até 10/09/2026, e a ausência dele era o
+     * defeito D-04: sem ack, `status_entrega = 'enviada'` significava
+     * apenas "o Baileys aceitou o stanza". Como `sendMessage()` aceita
+     * alegremente um JID que não existe, "enviada" não era evidência de
+     * absolutamente nada — e era exatamente o número que o painel da
+     * campanha mostrava como sucesso.
+     *
+     * O comentário em services/mensagens.ts que dizia "Baileys não tem
+     * webhook de status" descrevia esta lacuna, não uma limitação da
+     * biblioteca: o sinal sempre esteve aqui, em messages.update.
+     *
+     * Chega FORA DE ORDEM e mais de uma vez para o mesmo id — o WhatsApp
+     * não garante que 'entregue' preceda 'lido' na entrega do evento.
+     * Quem consome é responsável por só avançar o estado (ver
+     * RANK_STATUS_ENTREGA em services/mensagens.ts).
+     */
+    socket.ev.on('messages.update', async (atualizacoes) => {
+      if (!this.ackHandler) return;
+      for (const item of atualizacoes) {
+        try {
+          const waMessageId = item.key?.id;
+          if (!waMessageId) continue;
+          // `update.status` é o ack numérico do WhatsApp. Ausente quando a
+          // atualização é de outra natureza (edição, revogação), e nesse
+          // caso não há nada sobre entrega a concluir.
+          const status = ackParaStatus(
+            (item.update as { status?: number | null } | undefined)?.status,
+          );
+          if (!status) continue;
+          await this.ackHandler({
+            waMessageId,
+            status,
+            waJidDestino: item.key?.remoteJid ?? undefined,
+          });
+        } catch (err) {
+          // Um ack malformado não pode derrubar o processo que segura
+          // TODAS as linhas — este handler roda dentro do 'message' do
+          // WebSocket, fora de qualquer try/catch nosso mais acima.
+          logger.error(
+            {
+              canalId: this.canalId,
+              waMessageId: item.key?.id,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            'falha ao processar ack de entrega — seguindo para o próximo',
           );
         }
       }
@@ -645,6 +742,95 @@ export class BaileysChannel implements ChannelPort {
 
   aoReceber(handler: (evento: EventoRecebido) => Promise<void>): void {
     this.receiverHandler = handler;
+  }
+
+  aoConfirmarEntrega(handler: (ack: AckEntrega) => Promise<void>): void {
+    this.ackHandler = handler;
+  }
+
+  /**
+   * A linha está aquecida o bastante para disparo em massa?
+   *
+   * Ver a doc de ChannelPort.prontoParaCampanha. Aqui a resposta é: socket
+   * aberto há pelo menos AQUECIMENTO_CAMPANHA_MS. Atendimento 1:1 não passa
+   * por esta porta e continua saindo assim que o socket aceita.
+   */
+  prontoParaCampanha(): boolean {
+    if (!this.socket || this.statusAtual !== 'conectado') return false;
+    if (!this.conectadoDesde) return false;
+    return Date.now() - this.conectadoDesde >= AQUECIMENTO_CAMPANHA_MS;
+  }
+
+  /**
+   * Pré-voo: resolve o JID canônico de cada telefone (estágio 1).
+   *
+   * `onWhatsApp()` é a ÚNICA fonte correta do JID. No Brasil o número pode
+   * estar registrado com ou sem o nono dígito, e o WhatsApp responde com a
+   * forma canônica — que é justamente a informação que
+   * `${telefone}@s.whatsapp.net` chuta errado metade das vezes. Para
+   * contato roteado por `@lid` não existe chute nenhum que funcione.
+   *
+   * Em lotes com pausa: milhares de consultas de uma vez, numa linha nova,
+   * são o mesmo padrão de tráfego que a rampa existe para evitar.
+   *
+   * Telefone que não entra no mapa = NÃO FOI POSSÍVEL VERIFICAR (rede,
+   * rate limit). Quem chama não pode tratar isso como "não tem WhatsApp":
+   * a diferença entre "não tem" e "não sei" é a diferença entre excluir
+   * alguém da campanha com razão e excluir por engano.
+   */
+  async verificarNoWhatsApp(telefones: string[]): Promise<Map<string, string | null>> {
+    const resolvidos = new Map<string, string | null>();
+    if (!this.socket) return resolvidos;
+
+    // Consultar o mesmo número duas vezes não muda o resultado e conta
+    // para o rate limit do WhatsApp do mesmo jeito.
+    const unicos = [...new Set(telefones.map((t) => t.replace(/\D/g, '')).filter(Boolean))];
+
+    for (let i = 0; i < unicos.length; i += LOTE_PRE_VOO) {
+      const lote = unicos.slice(i, i + LOTE_PRE_VOO);
+      try {
+        const resposta = await this.socket.onWhatsApp(...lote);
+        // A resposta traz SÓ quem existe (a lib omite os ausentes), então
+        // o "não tem WhatsApp" é deduzido por ausência — mas apenas dentro
+        // de um lote que voltou com sucesso. Um lote que falhou não diz
+        // nada sobre ninguém, e por isso o catch abaixo não marca nada.
+        const achados = new Map<string, string>();
+        for (const item of resposta ?? []) {
+          if (!item?.exists || !item.jid) continue;
+          // `item.jid` é a forma canônica; os dígitos dele podem diferir
+          // do que perguntamos (é o caso do nono dígito).
+          achados.set(item.jid.replace(/\D/g, '').replace(/^0+/, ''), item.jid);
+        }
+        for (const telefone of lote) {
+          const direto = achados.get(telefone);
+          if (direto) {
+            resolvidos.set(telefone, direto);
+            continue;
+          }
+          // Casamento por sufixo: o JID canônico de um celular brasileiro
+          // pode ter um dígito a menos que o número consultado.
+          const porSufixo = [...achados.entries()].find(
+            ([digitos]) => digitos.endsWith(telefone.slice(-8)),
+          );
+          resolvidos.set(telefone, porSufixo ? porSufixo[1] : null);
+        }
+      } catch (err) {
+        // Lote perdido: NENHUM telefone dele entra no mapa. Ver a doc do
+        // método — ausência significa "não sei", nunca "não tem".
+        logger.warn(
+          {
+            canalId: this.canalId,
+            lote: lote.length,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          'pré-voo: lote falhou — estes números ficam sem verificação, não marcados como ausentes',
+        );
+      }
+      if (i + LOTE_PRE_VOO < unicos.length) {
+        await new Promise((r) => setTimeout(r, PAUSA_ENTRE_LOTES_MS));
+      }
+    }
+    return resolvidos;
   }
 
   /**

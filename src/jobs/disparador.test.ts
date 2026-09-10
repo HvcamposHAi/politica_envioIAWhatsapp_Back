@@ -12,7 +12,11 @@ interface Estado {
   disparos: Record<string, unknown>[];
   alvos: Record<string, unknown>[];
   clientes: Record<string, unknown>[];
-  canal: { conexao_status: string; criado_em: string };
+  canal: { conexao_status: string; criado_em: string; ultima_conexao?: string | null };
+  /** O interruptor de envio passou a viver no banco, por empresa
+   *  (hub.empresas.disparo_ativo) — antes era variável de processo, e todo
+   *  restart o devolvia ao default sem a tela perceber (D-13). */
+  empresa: { id: string; disparo_ativo: boolean };
   conversas: Record<string, unknown>[];
   mensagens: Record<string, unknown>[];
   atualizacoes: Array<{ tabela: string; patch: Record<string, unknown>; id?: string }>;
@@ -34,6 +38,7 @@ vi.mock('../db/client.server.js', () => {
     if (tabela === 'clientes') return est.clientes;
     if (tabela === 'conversas') return est.conversas;
     if (tabela === 'mensagens') return est.mensagens;
+    if (tabela === 'empresas') return [est.empresa as unknown as Record<string, unknown>];
     return [];
   }
 
@@ -53,6 +58,17 @@ vi.mock('../db/client.server.js', () => {
     }
     eq(k: string, v: unknown) {
       this.filtros.push(['eq', k, v]);
+      return this;
+    }
+    in(k: string, v: unknown[]) {
+      this.filtros.push(['in', k, v]);
+      return this;
+    }
+    not(k: string, _op: string, v: unknown) {
+      this.filtros.push(['not', k, v]);
+      return this;
+    }
+    lt() {
       return this;
     }
     neq(k: string, v: unknown) {
@@ -86,10 +102,28 @@ vi.mock('../db/client.server.js', () => {
 
     private casadas(): Record<string, unknown>[] {
       const fonte = fonteDe(this.tabela);
+
+      // Filtro de tabela embutida (`empresas!inner(...)` + `.eq('empresas.
+      // disparo_ativo', true)`). É como o worker passou a consultar o
+      // interruptor de envio: campanha de empresa desligada nem é lida.
+      // Quando o filtro não bate, NENHUMA linha volta — que é justamente o
+      // efeito do inner join no PostgREST.
+      const embutidos = this.filtros.filter(([, k]) => k.includes('.'));
+      for (const [, k, v] of embutidos) {
+        const campo = k.split('.')[1];
+        if ((est.empresa as Record<string, unknown>)[campo] !== v) return [];
+      }
+
       return fonte.filter((l) =>
-        this.filtros.every(([tipo, k, v]) =>
-          tipo === 'eq' ? l[k] === v : tipo === 'neq' ? l[k] !== v : l[k] === v,
-        ),
+        this.filtros
+          .filter(([, k]) => !k.includes('.'))
+          .every(([tipo, k, v]) => {
+            if (tipo === 'eq') return l[k] === v;
+            if (tipo === 'neq') return l[k] !== v;
+            if (tipo === 'in') return (v as unknown[]).includes(l[k]);
+            if (tipo === 'not') return l[k] !== v;
+            return l[k] === v;
+          }),
       );
     }
 
@@ -128,7 +162,29 @@ vi.mock('../db/client.server.js', () => {
     }
   }
 
-  return { supabaseAdmin: { from: (t: string) => new Consulta(t) } };
+  /**
+   * As RPCs de fila. `reservar_proximo_alvo` substituiu o
+   * `select limit 1` + `update` que deixava uma janela entre ler o alvo e
+   * marcá-lo (D-11) — aqui o mock reproduz o contrato que importa: tira UM
+   * alvo de 'pendente', já devolvendo ele marcado.
+   */
+  function rpc(nome: string, args: Record<string, unknown>) {
+    if (nome === 'reservar_proximo_alvo') {
+      const alvo = est.alvos.find(
+        (a) => a.disparo_id === args.p_disparo_id && a.status === 'pendente',
+      );
+      if (!alvo) return Promise.resolve({ data: [], error: null });
+      alvo.status = 'enviando_agora';
+      alvo.reservado_em = new Date().toISOString();
+      return Promise.resolve({ data: [alvo], error: null });
+    }
+    if (nome === 'liberar_alvos_travados') {
+      return Promise.resolve({ data: 0, error: null });
+    }
+    return Promise.resolve({ data: null, error: null });
+  }
+
+  return { supabaseAdmin: { from: (t: string) => new Consulta(t), rpc } };
 });
 
 /** A posse do gateway (jobs/lease.ts) barra tudo que toca em canal quando
@@ -141,20 +197,36 @@ vi.mock('./lease.js', () => ({
 
 const enviarMock = vi.fn();
 const digitandoMock = vi.fn();
+/** Pré-voo (onWhatsApp). Por padrão todo mundo TEM WhatsApp — os testes que
+ *  exercitam o contrário sobrescrevem. */
+const verificarMock = vi.fn();
+/** Aquecimento da linha (estágio 2). Por padrão aquecida. */
+let linhaAquecida = true;
+
+function canalFalso() {
+  return {
+    enviar: enviarMock,
+    sinalizarDigitando: digitandoMock,
+    verificarNoWhatsApp: verificarMock,
+    prontoParaCampanha: () => linhaAquecida,
+  };
+}
 
 vi.mock('../channels/registry.js', () => ({
-  canalEmMemoria: () => ({
-    enviar: enviarMock,
-    sinalizarDigitando: digitandoMock,
-  }),
-  obterOuCriarCanal: async () => ({
-    enviar: enviarMock,
-    sinalizarDigitando: digitandoMock,
-  }),
+  canalEmMemoria: () => canalFalso(),
+  obterOuCriarCanal: async () => canalFalso(),
+}));
+
+/** Marcação de entrega incerta é varredura de manutenção — roda por tempo,
+ *  não por passada, e não interessa a nenhum caso aqui. */
+vi.mock('../services/ackEntrega.js', () => ({
+  marcarEntregasIncertas: async () => 0,
 }));
 
 const { passadaDoDisparador, limparAgendamentos, primeiroNome, pararTudo, religarDisparos } =
   await import('./disparador.js');
+
+const EMPRESA = 'emp-1';
 
 /** 12:00 BRT de um dia útil — dentro da janela padrão 09:00–20:00. */
 const AGORA = new Date('2026-09-01T15:00:00Z');
@@ -196,9 +268,17 @@ function clienteBase(over: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   temPosse = true;
+  linhaAquecida = true;
   limparAgendamentos();
-  religarDisparos();
   enviarMock.mockResolvedValue({ waMessageId: 'wa-1', status: 'enviada' });
+  // Pré-voo devolve o JID canônico. Devolver um JID DIFERENTE do telefone
+  // é de propósito: é o caso do nono dígito, que é a razão inteira de o
+  // estágio 1 existir (D-03).
+  verificarMock.mockImplementation(async (telefones: string[]) => {
+    const mapa = new Map<string, string | null>();
+    for (const t of telefones) mapa.set(t.replace(/\D/g, ''), `${t}@s.whatsapp.net`);
+    return mapa;
+  });
   est = {
     disparos: [disparoBase()],
     alvos: [
@@ -213,7 +293,12 @@ beforeEach(() => {
       },
     ],
     clientes: [clienteBase()],
-    canal: { conexao_status: 'conectado', criado_em: '2026-08-20T12:00:00Z' },
+    canal: {
+      conexao_status: 'conectado',
+      criado_em: '2026-08-20T12:00:00Z',
+      ultima_conexao: '2026-08-20T12:00:00Z',
+    },
+    empresa: { id: EMPRESA, disparo_ativo: true },
     conversas: [],
     mensagens: [],
     atualizacoes: [],
@@ -287,12 +372,27 @@ describe('passadaDoDisparador', () => {
     expect(String(est.disparos[0].pausa_motivo)).toContain('linha de WhatsApp caiu');
   });
 
-  it('não envia com o interruptor geral desligado', async () => {
-    await pararTudo('teste');
+  it('não envia com o interruptor da empresa desligado', async () => {
+    await pararTudo(EMPRESA, 'teste');
     enviarMock.mockClear();
     const r = await passadaDoDisparador(AGORA);
     expect(r.enviados).toBe(0);
     expect(enviarMock).not.toHaveBeenCalled();
+  });
+
+  it('"parar tudo" sobrevive a restart: o estado fica no banco, não em memória', async () => {
+    // D-13. Antes disto o interruptor era variável de processo, e todo
+    // deploy o devolvia ao default do ambiente — "Parar tudo" clicado às
+    // 18h não valia mais às 19h, sem ninguém perceber.
+    await pararTudo(EMPRESA, 'teste');
+    expect(est.empresa.disparo_ativo).toBe(false);
+    await religarDisparos(EMPRESA);
+    expect(est.empresa.disparo_ativo).toBe(true);
+  });
+
+  it('"parar tudo" marca o código de pausa, para nada retomar sozinho', async () => {
+    await pararTudo(EMPRESA, 'teste');
+    expect(est.disparos[0].pausa_codigo).toBe('parada_geral');
   });
 
   it('NÃO ENVIA para quem pediu descadastro depois de entrar na fila', async () => {
@@ -357,5 +457,91 @@ describe('posse do gateway', () => {
     temPosse = true;
     const r = await passadaDoDisparador(AGORA);
     expect(r.enviados).toBe(1);
+  });
+});
+
+/* =====================================================================
+ * Regressões do dossiê de 10/09/2026
+ *
+ * Cada caso aqui fixa um defeito que já custou uma campanha inteira sem
+ * envio nenhum. Eles não testam funcionalidade nova: testam que a falha
+ * antiga não volta.
+ * ===================================================================== */
+
+describe('D-03 · identidade do destinatário (pré-voo)', () => {
+  it('NÃO envia para número que não está no WhatsApp — marca sem_whatsapp', async () => {
+    // O defeito original em uma frase: sendMessage() para um JID que não
+    // existe NÃO FALHA. O Baileys devolve um key.id, gravávamos "enviada",
+    // e a mensagem ia para lugar nenhum. A campanha reportava sucesso com
+    // zero entregas.
+    verificarMock.mockResolvedValue(new Map([['5547999887766', null]]));
+
+    const r = await passadaDoDisparador(AGORA);
+
+    expect(enviarMock).not.toHaveBeenCalled();
+    expect(r.enviados).toBe(0);
+    expect(est.alvos[0].status).toBe('sem_whatsapp');
+  });
+
+  it('envia para o JID CANÔNICO, não para o telefone reconstruído', async () => {
+    // O nono dígito: o número consultado e o JID registrado podem diferir.
+    // Reconstruir "${telefone}@s.whatsapp.net" acerta por sorte.
+    verificarMock.mockResolvedValue(new Map([['5547999887766', '554799887766@s.whatsapp.net']]));
+
+    await passadaDoDisparador(AGORA);
+
+    expect(enviarMock).toHaveBeenCalledTimes(1);
+    expect(enviarMock.mock.calls[0][0].waJidDestino).toBe('554799887766@s.whatsapp.net');
+  });
+
+  it('grava o JID resolvido no cadastro, para não reconsultar', async () => {
+    verificarMock.mockResolvedValue(new Map([['5547999887766', '554799887766@s.whatsapp.net']]));
+    await passadaDoDisparador(AGORA);
+    expect(est.clientes[0].wa_jid).toBe('554799887766@s.whatsapp.net');
+  });
+
+  it('"não deu para verificar" devolve o alvo à fila em vez de excluí-lo', async () => {
+    // A distinção que protege a pessoa: NÃO SEI ≠ NÃO TEM. Marcar
+    // sem_whatsapp aqui excluiria da campanha, para sempre, alguém que só
+    // teve o azar de uma falha de rede no instante errado.
+    verificarMock.mockResolvedValue(new Map());
+
+    const r = await passadaDoDisparador(AGORA);
+
+    expect(enviarMock).not.toHaveBeenCalled();
+    expect(est.alvos[0].status).toBe('pendente');
+    expect(r.pulados.jid_nao_verificado).toBe(1);
+  });
+
+  it('não reconsulta quem já tem JID salvo', async () => {
+    est.clientes = [clienteBase({ wa_jid: '5547999887766@s.whatsapp.net' })];
+    await passadaDoDisparador(AGORA);
+    expect(verificarMock).not.toHaveBeenCalled();
+    expect(enviarMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('estágio 2 · aquecimento da linha', () => {
+  it('não dispara em cima da reconexão', async () => {
+    // O socket abre antes de a sessão estar utilizável, e a reconexão é
+    // justamente quando o worker acorda com a fila cheia na mão.
+    linhaAquecida = false;
+    const r = await passadaDoDisparador(AGORA);
+    expect(enviarMock).not.toHaveBeenCalled();
+    expect(r.pulados.aquecendo_linha).toBe(1);
+  });
+});
+
+describe('D-11 · reserva atômica do alvo', () => {
+  it('tira o alvo de "pendente" ANTES de enviar', async () => {
+    // Antes disto o alvo só saía de 'pendente' depois do envio — segundos
+    // depois. Nessa janela um segundo processo lia o mesmo alvo, e o
+    // índice único só barra a duplicata depois de a mensagem ter saído.
+    enviarMock.mockImplementation(async () => {
+      expect(est.alvos[0].status).not.toBe('pendente');
+      return { waMessageId: 'wa-1', status: 'enviada' };
+    });
+    await passadaDoDisparador(AGORA);
+    expect(enviarMock).toHaveBeenCalledTimes(1);
   });
 });

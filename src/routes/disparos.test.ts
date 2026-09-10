@@ -35,12 +35,13 @@ vi.mock('../services/personalizacaoIA.js', () => ({
   emLotes: (itens: unknown[]) => (itens.length ? [itens] : []),
 }));
 
-const pararTudoMock = vi.fn(async (_motivo: string) => 2);
+const pararTudoMock = vi.fn(async (_empresaId: string, _motivo: string) => 2);
 const religarMock = vi.fn();
 vi.mock('../jobs/disparador.js', () => ({
-  pararTudo: (m: string) => pararTudoMock(m),
-  religarDisparos: () => religarMock(),
-  disparoHabilitado: () => true,
+  pararTudo: (e: string, m: string) => pararTudoMock(e, m),
+  religarDisparos: (e: string) => religarMock(e),
+  disparoHabilitado: async () => true,
+  processoPodeDisparar: () => true,
   primeiroNome: (n: string) => n.trim().split(/\s+/)[0] ?? '',
 }));
 
@@ -391,7 +392,11 @@ describe('pausar, retomar e parar tudo', () => {
       .send({ empresaId: EMPRESA, motivo: 'reclamação no grupo' });
     expect(r.status).toBe(200);
     expect(r.body.disparosPausados).toBe(2);
-    expect(pararTudoMock).toHaveBeenCalledWith('reclamação no grupo');
+    // ESCOPADO POR EMPRESA (D-07). Até 10/09/2026 o update de pararTudo
+    // não tinha filtro de empresa nenhum, apesar de a rota já ter validado
+    // ctx.empresaId na linha de cima: um admin da empresa A parava as
+    // campanhas da empresa B.
+    expect(pararTudoMock).toHaveBeenCalledWith(EMPRESA, 'reclamação no grupo');
   });
 
   it('religar não retoma disparo nenhum sozinho', async () => {
@@ -401,7 +406,7 @@ describe('pausar, retomar e parar tudo', () => {
       .post('/disparos/religar')
       .set('x-teste-user-id', ADMIN)
       .send({ empresaId: EMPRESA });
-    expect(religarMock).toHaveBeenCalled();
+    expect(religarMock).toHaveBeenCalledWith(EMPRESA);
     expect(est.disparos[0].pausado_em).toBe('2026-09-01T10:00:00Z');
   });
 

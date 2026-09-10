@@ -13,6 +13,7 @@ import { TwilioChannel } from './twilio.adapter.js';
 import { supabaseAdmin } from '../db/client.server.js';
 import { processarEventoRecebido } from '../services/mensagens.js';
 import { obterCredenciaisTwilio } from '../services/twilioCredenciais.js';
+import { aplicarAckDeEntrega } from '../services/ackEntrega.js';
 
 const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL ?? 'warn' });
 
@@ -32,7 +33,12 @@ export async function obterOuCriarCanal(canalId: string): Promise<ChannelPort> {
     throw new Error(`Canal ${canalId} não encontrado em hub.canais: ${error?.message ?? 'sem dados'}`);
   }
 
-  const canal =
+  // Anotado como ChannelPort, não como a união das duas classes: o
+  // contrato tem métodos opcionais (aoConfirmarEntrega, verificarNoWhatsApp)
+  // que só um dos transportes implementa, e é exatamente para isso que eles
+  // são opcionais. Sem a anotação, o TypeScript infere a união concreta e
+  // recusa até a chamada opcional.
+  const canal: ChannelPort =
     data.transporte === 'twilio'
       ? new TwilioChannel(canalId, data.numero, await obterCredenciaisTwilio())
       : new BaileysChannel(canalId);
@@ -57,6 +63,25 @@ export async function obterOuCriarCanal(canalId: string): Promise<ChannelPort> {
       );
     }
   });
+
+  // Confirmação de entrega. Mesmo padrão do aoReceber acima e pela mesma
+  // razão: o try/catch mora aqui, não dentro do handler, porque isto roda
+  // no 'message' do WebSocket e uma promise rejeitada sem catch derrubaria
+  // o processo inteiro — com ele, TODAS as linhas.
+  //
+  // O adapter da Twilio não implementa: lá o mesmo sinal chega por webhook
+  // (webhooks/twilio.ts), não por evento de socket. Daí o opcional.
+  canal.aoConfirmarEntrega?.(async (ack) => {
+    try {
+      await aplicarAckDeEntrega(ack);
+    } catch (err) {
+      logger.error(
+        { canalId, waMessageId: ack.waMessageId, err: err instanceof Error ? err.message : String(err) },
+        'falha ao aplicar confirmação de entrega',
+      );
+    }
+  });
+
   canaisAtivos.set(canalId, canal);
   return canal;
 }

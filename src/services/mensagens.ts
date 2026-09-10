@@ -854,10 +854,20 @@ const RANK_STATUS_ENTREGA: Record<string, number> = {
 };
 
 /**
- * Atualiza hub.mensagens.status_entrega a partir de um callback de status de
- * provedor (hoje só Twilio; Baileys não tem webhook de status, só o insert
- * síncrono em routes/mensagens.ts). Busca por wa_message_id — mesma chave de
+ * Atualiza hub.mensagens.status_entrega a partir de uma confirmação de
+ * entrega do provedor. Busca por wa_message_id — mesma chave de
  * idempotência do fluxo de entrada.
+ *
+ * DOIS CHAMADORES, um por transporte: o webhook da Twilio
+ * (webhooks/twilio.ts) e o ack do Baileys (services/ackEntrega.ts, a
+ * partir de `messages.update`).
+ *
+ * O comentário que ficou aqui até 10/09/2026 dizia "Baileys não tem
+ * webhook de status". Isso descrevia uma LACUNA NOSSA, não uma limitação
+ * da biblioteca — o sinal sempre esteve em `messages.update`, e não
+ * consumi-lo era o defeito D-04: `status_entrega = 'enviada'` significava
+ * só "o transporte aceitou o stanza", que é uma afirmação sobre nós e não
+ * sobre a pessoa do outro lado.
  *
  * "0 linhas afetadas" (mensagem ainda não commitada, ou wa_message_id nunca
  * existiu) não é erro: retorna false e quem chamou decide o que fazer — no

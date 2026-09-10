@@ -26,11 +26,14 @@
 import pino from 'pino';
 import { supabaseAdmin } from '../db/client.server.js';
 import { canalEmMemoria, obterOuCriarCanal } from '../channels/registry.js';
+import type { ChannelPort } from '../channels/port.js';
 import { souODonoDoGateway } from './lease.js';
+import { marcarEntregasIncertas } from '../services/ackEntrega.js';
 import {
   aplicarCampos,
   avaliarPausaAutomatica,
   decidir,
+  dentroDaJanela,
   diaNaCampanha,
   diasDeVidaDaLinha,
   proximoIntervaloMs,
@@ -48,6 +51,42 @@ export const TICK_MS = 5_000;
 
 /** Janela recente para calcular taxa de falha e de opt-out. */
 const JANELA_PAUSA_MIN = 30;
+
+/**
+ * De quanto em quanto tempo registrar que o worker está vivo.
+ *
+ * NÃO É RUÍDO DE LOG — é a lacuna que custou a investigação de 10/09/2026.
+ * A campanha de 04/09 passou 56 minutos com janela aberta, canal
+ * conectado, posse renovada e fila cheia, sem enviar nada e SEM DEIXAR
+ * RASTRO NENHUM: `passadaDoDisparador` retornava na primeira linha
+ * (interruptor desligado) em silêncio absoluto. Um worker parado de
+ * propósito era indistinguível de um worker morto, e essa diferença só
+ * apareceu depois de reconstruir a linha do tempo a partir do banco.
+ *
+ * Uma linha a cada 5 minutos é barata e transforma a próxima investigação
+ * de horas em minutos.
+ */
+const BATIMENTO_MS = 5 * 60_000;
+let ultimoBatimento = 0;
+
+/** Motivos de pausa que o código entende (hub.disparos.pausa_codigo).
+ *  Só `linha_caiu` é elegível a retomada automática — ver retomarOQueCaiu. */
+export type PausaCodigo =
+  | 'linha_caiu'
+  | 'sem_canal'
+  | 'taxa_de_optout'
+  | 'taxa_de_falha'
+  | 'parada_manual'
+  | 'parada_geral';
+
+/** Quanto tempo o canal precisa estar de pé antes de uma campanha pausada
+ *  por queda de linha voltar sozinha. Ver retomarOQueCaiu. */
+const ESTABILIDADE_PARA_RETOMAR_MS = 60_000;
+
+/** A cada quantas passadas rodar a manutenção (reservas presas, entregas
+ *  não confirmadas). 60 passadas de 5s = 5 minutos. */
+const PASSADAS_POR_MANUTENCAO = 60;
+let passadasDesdeManutencao = 0;
 
 function limiares(): LimiaresPausa {
   return {
@@ -72,35 +111,85 @@ function rampaDoAmbiente(): number[] {
  * de qualquer coisa na passada — é o que faz o botão ter efeito no próximo
  * tick, e não no próximo deploy.
  */
-let interruptorGeral = String(process.env.DISPARO_ATIVO ?? 'true') !== 'false';
+const interruptorGeral = String(process.env.DISPARO_ATIVO ?? 'true') !== 'false';
 
-export function disparoHabilitado(): boolean {
+/**
+ * A chave-geral do PROCESSO. Vem só do ambiente e não muda em runtime.
+ *
+ * O interruptor que o painel opera é outro, e vive no banco por empresa
+ * (hub.empresas.disparo_ativo) — ver disparoHabilitado(). A separação é o
+ * conserto de D-13: até 10/09/2026 o botão da tela mexia numa variável em
+ * memória, então todo deploy devolvia o estado ao default do ambiente sem
+ * ninguém perceber. "Parar tudo" clicado às 18h não sobrevivia ao deploy
+ * das 19h.
+ */
+export function processoPodeDisparar(): boolean {
   return interruptorGeral;
 }
 
-export function religarDisparos(): void {
-  interruptorGeral = true;
+/**
+ * O envio está ligado para esta empresa?
+ *
+ * As duas condições precisam valer: a chave-geral do processo
+ * (DISPARO_ATIVO) e o interruptor da empresa, persistido no banco.
+ */
+export async function disparoHabilitado(empresaId: string): Promise<boolean> {
+  if (!interruptorGeral) return false;
+  const { data } = await supabaseAdmin
+    .from('empresas')
+    .select('disparo_ativo')
+    .eq('id', empresaId)
+    .maybeSingle<{ disparo_ativo: boolean }>();
+  return data?.disparo_ativo === true;
+}
+
+/** Religa o envio DESTA empresa. Não retoma campanha nenhuma: cada uma
+ *  precisa ser retomada de propósito, uma a uma. */
+export async function religarDisparos(empresaId: string): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from('empresas')
+    .update({ disparo_ativo: true })
+    .eq('id', empresaId);
+  if (error) throw new Error(`falha ao religar o envio: ${error.message}`);
+  logger.warn({ empresaId }, 'envio religado para a empresa');
 }
 
 /**
- * Para tudo: interrompe o worker E pausa no banco todos os disparos que
- * estavam enviando. Os dois, de propósito — só o flag em memória voltaria
- * a enviar no próximo deploy, e só o banco não impediria a passada que já
- * está em andamento.
+ * Para tudo: desliga o interruptor da empresa E pausa no banco os disparos
+ * dela que estavam enviando. Os dois, de propósito — só o interruptor não
+ * interromperia a passada em andamento, e só a pausa deixaria a próxima
+ * campanha criada sair sozinha.
+ *
+ * ESCOPADO POR EMPRESA (D-07). Até 10/09/2026 o `update` não tinha filtro
+ * de empresa nenhum, apesar de a rota já ter validado `ctx.empresaId` na
+ * linha de cima: um admin da empresa A parava as campanhas da empresa B.
  */
-export async function pararTudo(motivo: string): Promise<number> {
-  interruptorGeral = false;
+export async function pararTudo(empresaId: string, motivo: string): Promise<number> {
+  const { error: erroInterruptor } = await supabaseAdmin
+    .from('empresas')
+    .update({ disparo_ativo: false })
+    .eq('id', empresaId);
+  if (erroInterruptor) {
+    // Sem interruptor desligado, pausar as campanhas não basta — a próxima
+    // criada sairia. Falhar alto é melhor que um "parado" que não parou.
+    throw new Error(`falha ao desligar o envio: ${erroInterruptor.message}`);
+  }
+
   const { data, error } = await supabaseAdmin
     .from('disparos')
-    .update({ pausado_em: new Date().toISOString(), pausa_motivo: motivo })
+    .update({ pausado_em: new Date().toISOString(), pausa_motivo: motivo, pausa_codigo: 'parada_geral' })
+    .eq('empresa_id', empresaId)
     .eq('status', 'enviando')
     .is('pausado_em', null)
     .select('id');
   if (error) {
-    logger.error({ err: error.message }, 'pararTudo: falha ao pausar no banco — o worker já está parado');
+    logger.error(
+      { empresaId, err: error.message },
+      'pararTudo: interruptor desligado, mas as campanhas não foram pausadas',
+    );
     return 0;
   }
-  logger.warn({ motivo, pausados: data?.length ?? 0 }, 'PARAR TUDO acionado');
+  logger.warn({ empresaId, motivo, pausados: data?.length ?? 0 }, 'PARAR TUDO acionado');
   return data?.length ?? 0;
 }
 
@@ -161,12 +250,46 @@ export interface ResultadoPassada {
  */
 export async function passadaDoDisparador(agora = new Date()): Promise<ResultadoPassada> {
   const resultado: ResultadoPassada = { avaliados: 0, enviados: 0, pulados: {}, pausados: 0 };
+
+  const dono = souODonoDoGateway();
+
+  // BATIMENTO. Registrado ANTES de qualquer decisão de sair, justamente
+  // para cobrir os casos em que o worker não faz nada — que era o cenário
+  // sem rastro nenhum do incidente de 04/09. Ver BATIMENTO_MS.
+  if (agora.getTime() - ultimoBatimento >= BATIMENTO_MS) {
+    ultimoBatimento = agora.getTime();
+    logger.warn(
+      {
+        habilitado: interruptorGeral,
+        souDono: dono,
+        motivo: !interruptorGeral
+          ? 'DISPARO_ATIVO=false ou "parar tudo" acionado — nenhuma mensagem sai'
+          : !dono
+            ? 'outra instância detém a posse do gateway — worker em espera'
+            : 'operando',
+      },
+      'disparador: batimento',
+    );
+  }
+
   if (!interruptorGeral) return resultado;
   // Dois processos tirando alvos da mesma fila mandariam a mesma mensagem
   // duas vezes para a mesma pessoa. O índice único (disparo_id, telefone)
   // barra a duplicata no banco, mas só DEPOIS de a mensagem ter saído —
   // esta guarda é a que impede o envio. Ver jobs/lease.ts.
-  if (!souODonoDoGateway()) return resultado;
+  if (!dono) return resultado;
+
+  // Manutenção periódica: devolver à fila alvos presos por um processo que
+  // morreu no meio, e parar de contar como sucesso o que saiu e nunca foi
+  // confirmado. As duas coisas corrigem estado, não enviam nada.
+  if (++passadasDesdeManutencao >= PASSADAS_POR_MANUTENCAO) {
+    passadasDesdeManutencao = 0;
+    await rodarManutencao(agora);
+  }
+
+  // Retomada governada ANTES de avaliar as campanhas ativas: uma campanha
+  // que volta nesta passada já pode enviar nela mesma.
+  await retomarOQueCaiu(agora);
 
   try {
     const { data: disparos, error } = await supabaseAdmin
@@ -174,9 +297,14 @@ export async function passadaDoDisparador(agora = new Date()): Promise<Resultado
       .select(
         'id, empresa_id, canal_id, status, pausado_em, texto_base, janela_inicio, janela_fim, ' +
           'intervalo_min_seg, intervalo_max_seg, teto_diario, enviados_hoje, contador_dia, ' +
-          'amostra_aprovada_em',
+          // !inner: a empresa entra como JOIN obrigatório só para filtrar
+          // pelo interruptor dela. Campanha de empresa com o envio
+          // desligado nem é lida — é o "Parar tudo" tendo efeito no
+          // próximo tick, agora sobrevivendo a restart (D-13).
+          'amostra_aprovada_em, empresas!inner(disparo_ativo)',
       )
       .eq('status', 'enviando')
+      .eq('empresas.disparo_ativo', true)
       .is('pausado_em', null);
 
     if (error) throw new Error(error.message);
@@ -209,12 +337,128 @@ export async function passadaDoDisparador(agora = new Date()): Promise<Resultado
   return resultado;
 }
 
+/**
+ * Manutenção de estado. Não envia nada; conserta o que ficou torto.
+ *
+ * Duas varreduras, as duas nascidas de "o processo pode morrer a qualquer
+ * momento e todo deploy é um restart":
+ *
+ *   · alvo reservado por uma instância que morreu antes de enviar fica em
+ *     `enviando_agora` para sempre — some da fila sem ter recebido nada;
+ *   · alvo que saiu e nunca teve ack não pode continuar contando como
+ *     sucesso no painel (ver services/ackEntrega.ts).
+ */
+async function rodarManutencao(agora: Date): Promise<void> {
+  try {
+    const { data, error } = await supabaseAdmin.rpc('liberar_alvos_travados', { p_minutos: 2 });
+    if (error) throw new Error(error.message);
+    if (typeof data === 'number' && data > 0) {
+      logger.warn({ devolvidos: data }, 'alvos presos em enviando_agora devolvidos à fila');
+    }
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'manutenção: falha ao liberar alvos travados',
+    );
+  }
+
+  try {
+    await marcarEntregasIncertas(agora);
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'manutenção: falha ao marcar entregas incertas',
+    );
+  }
+}
+
+/**
+ * Retomada automática — e SÓ de quem caiu por queda de linha (estágio 7).
+ *
+ * A regra antiga ("quem religa o disparo é gente") é defensável e continua
+ * valendo para tudo que envolve a pessoa do outro lado: opt-out alto, taxa
+ * de falha alta e parada manual seguem exigindo decisão humana, sempre.
+ *
+ * O que ela não previa é a queda que não é incidente: em 04/09 a linha caiu
+ * por hibernação da hospedagem e voltou em NOVE SEGUNDOS — e as duas
+ * campanhas ficaram paradas para sempre, sem ninguém saber. Exigir gente
+ * para desfazer um problema que já se desfez sozinho não protege ninguém;
+ * só transforma toda instabilidade transitória em campanha morta.
+ *
+ * Daí `pausa_codigo` ser um valor fechado: sem ele não havia como
+ * distinguir por código "caiu sozinha" de "mandaram parar", e retomar às
+ * cegas seria muito pior que não retomar.
+ */
+async function retomarOQueCaiu(agora: Date): Promise<void> {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('disparos')
+      .select('id, canal_id, janela_inicio, janela_fim, empresas!inner(disparo_ativo)')
+      .eq('status', 'enviando')
+      .eq('pausa_codigo', 'linha_caiu')
+      // Empresa com o envio desligado não tem campanha retomada por
+      // ninguém, muito menos automaticamente.
+      .eq('empresas.disparo_ativo', true)
+      .not('pausado_em', 'is', null);
+    if (error) throw new Error(error.message);
+
+    type Linha = { id: string; canal_id: string | null; janela_inicio: string; janela_fim: string };
+    for (const disparo of (data ?? []) as unknown as Linha[]) {
+      if (!disparo.canal_id) continue;
+
+      // Fora da janela não há por que retomar agora — a próxima passada
+      // dentro do horário retoma, e retomar fora dela deixaria a campanha
+      // "ativa" à noite só para ser barrada a cada tick.
+      if (!dentroDaJanela(agora, disparo.janela_inicio, disparo.janela_fim)) continue;
+
+      // O banco dizer 'conectado' não basta: o socket pode ter aberto há
+      // dois segundos. `prontoParaCampanha()` é o aquecimento do estágio 2.
+      if (!(await canalConectado(disparo.canal_id))) continue;
+      const canal = canalEmMemoria(disparo.canal_id);
+      if (!canal) continue;
+      if (canal.prontoParaCampanha && !canal.prontoParaCampanha()) continue;
+
+      const desde = await estavelDesde(disparo.canal_id);
+      if (!desde || agora.getTime() - desde.getTime() < ESTABILIDADE_PARA_RETOMAR_MS) continue;
+
+      await supabaseAdmin
+        .from('disparos')
+        .update({ pausado_em: null, pausa_motivo: null, pausa_codigo: null })
+        .eq('id', disparo.id)
+        // Só retoma se AINDA estiver pausada por queda de linha. Entre a
+        // leitura e este update alguém pode ter clicado "Parar tudo", e a
+        // decisão humana vence sempre.
+        .eq('pausa_codigo', 'linha_caiu');
+
+      logger.warn(
+        { disparoId: disparo.id, canalId: disparo.canal_id },
+        'campanha retomada automaticamente: a linha voltou e está estável',
+      );
+    }
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      'falha na retomada automática — campanhas seguem pausadas, que é o lado seguro',
+    );
+  }
+}
+
+/** Desde quando o canal está conectado, segundo o banco. */
+async function estavelDesde(canalId: string): Promise<Date | null> {
+  const { data } = await supabaseAdmin
+    .from('canais')
+    .select('ultima_conexao')
+    .eq('id', canalId)
+    .maybeSingle<{ ultima_conexao: string | null }>();
+  return data?.ultima_conexao ? new Date(data.ultima_conexao) : null;
+}
+
 async function processarUmDisparo(disparo: DisparoRow, agora: Date): Promise<string> {
   const agendado = proximoEnvioEm.get(disparo.id);
   if (agendado !== undefined && agora.getTime() < agendado) return 'aguardando_intervalo';
 
   if (!disparo.canal_id) {
-    await pausar(disparo.id, 'Disparo sem canal escolhido.');
+    await pausar(disparo.id, 'sem_canal', 'Disparo sem canal escolhido.');
     return 'pausado';
   }
 
@@ -225,6 +469,7 @@ async function processarUmDisparo(disparo: DisparoRow, agora: Date): Promise<str
   if (motivoPausa) {
     await pausar(
       disparo.id,
+      motivoPausa,
       motivoPausa === 'taxa_de_optout'
         ? `Pausado automaticamente: ${janela.optOuts} descadastro(s) nos últimos ${janela.enviados} envios.`
         : `Pausado automaticamente: ${janela.falhas} falha(s) nos últimos ${janela.enviados} envios.`,
@@ -272,12 +517,23 @@ async function processarUmDisparo(disparo: DisparoRow, agora: Date): Promise<str
     }
     if (decisao.motivo === 'canal_desconectado') {
       // Pausa de verdade, não só "pula": senão a campanha fica em silêncio
-      // e ninguém sabe por quê. O vigia de canais reconecta; quem religa o
-      // disparo é gente.
-      await pausar(disparo.id, 'Pausado automaticamente: a linha de WhatsApp caiu.');
+      // e ninguém sabe por quê. O vigia de canais reconecta; a campanha
+      // volta por retomarOQueCaiu() — e SÓ ela, porque só esta pausa
+      // carrega o código 'linha_caiu'. Toda outra continua esperando gente.
+      await pausar(disparo.id, 'linha_caiu', 'Pausado automaticamente: a linha de WhatsApp caiu.');
       return 'pausado';
     }
     return decisao.motivo;
+  }
+
+  // AQUECIMENTO DA LINHA (estágio 2). Depois de `decidir`, de propósito:
+  // não é uma condição de parada da campanha, é um "ainda não, espera o
+  // socket assentar". O socket abre antes de a sessão estar utilizável, e
+  // a reconexão automática é justamente quando o worker acorda com a fila
+  // cheia na mão. Atendimento 1:1 não passa por aqui.
+  const canalVivo = canalEmMemoria(disparo.canal_id);
+  if (canalVivo?.prontoParaCampanha && !canalVivo.prontoParaCampanha()) {
+    return 'aquecendo_linha';
   }
 
   const enviou = await enviarProximo(disparo, agora);
@@ -297,7 +553,11 @@ async function contarPendentes(disparoId: string): Promise<number> {
     .from('disparo_alvos')
     .select('id', { count: 'exact', head: true })
     .eq('disparo_id', disparoId)
-    .eq('status', 'pendente');
+    // `enviando_agora` conta como pendente: é alvo reservado que ainda não
+    // saiu. Sem ele aqui, uma campanha cujo último alvo está reservado
+    // seria declarada CONCLUÍDA antes de a mensagem sair — e a conclusão
+    // é irreversível pela tela.
+    .in('status', ['pendente', 'enviando_agora']);
   if (error) throw new Error(`falha ao contar pendentes: ${error.message}`);
   return count ?? 0;
 }
@@ -322,11 +582,29 @@ async function idadeDaLinha(canalId: string, agora: Date): Promise<number> {
   return diasDeVidaDaLinha(nascimento ? new Date(nascimento) : null, agora);
 }
 
+/**
+ * Status de alvo que representam UMA TENTATIVA DE ENVIO.
+ *
+ * O denominador do freio automático são as mensagens que de fato saíram.
+ * `cancelado` (descadastrou antes do envio) e `sem_whatsapp` (o pré-voo
+ * barrou) nunca foram tentativa, e contá-los inflava o denominador —
+ * diluindo a taxa de falha para baixo e adiando exatamente a pausa que o
+ * freio existe para provocar.
+ */
+const STATUS_DE_TENTATIVA = new Set([
+  'enviado',
+  'entregue',
+  'lido',
+  'entrega_incerta',
+  'falhou',
+]);
+
 async function medirJanelaRecente(
   disparoId: string,
   agora: Date,
 ): Promise<{ enviados: number; falhas: number; optOuts: number }> {
-  const desde = new Date(agora.getTime() - JANELA_PAUSA_MIN * 60_000).toISOString();
+  const desdeMs = agora.getTime() - JANELA_PAUSA_MIN * 60_000;
+  const desde = new Date(desdeMs).toISOString();
 
   const { data, error } = await supabaseAdmin
     .from('disparo_alvos')
@@ -336,22 +614,32 @@ async function medirJanelaRecente(
   if (error) throw new Error(`falha ao medir a janela: ${error.message}`);
 
   type Linha = { status: string; clientes: { opt_out_em: string | null } | null };
-  const linhas = (data ?? []) as unknown as Linha[];
+  const linhas = ((data ?? []) as unknown as Linha[]).filter((l) => STATUS_DE_TENTATIVA.has(l.status));
 
   return {
     enviados: linhas.length,
     falhas: linhas.filter((l) => l.status === 'falhou').length,
-    optOuts: linhas.filter((l) => l.clientes?.opt_out_em && l.clientes.opt_out_em >= desde).length,
+    // COMPARAR INSTANTES, NÃO TEXTO. Até 10/09/2026 isto era
+    // `l.clientes.opt_out_em >= desde` — comparação lexicográfica entre
+    // "2026-09-04T22:56:23.339+00:00" (grafia do PostgREST) e
+    // "2026-09-04T22:56:23.339Z" (grafia do toISOString). São o mesmo
+    // instante escrito de dois jeitos, e o `>=` de string não sabe disso:
+    // o freio de descadastro — descrito neste próprio arquivo como a
+    // medida mais importante da campanha — não era confiável (D-08).
+    optOuts: linhas.filter((l) => {
+      const t = l.clientes?.opt_out_em ? Date.parse(l.clientes.opt_out_em) : NaN;
+      return Number.isFinite(t) && t >= desdeMs;
+    }).length,
   };
 }
 
-async function pausar(disparoId: string, motivo: string): Promise<void> {
+async function pausar(disparoId: string, codigo: PausaCodigo, motivo: string): Promise<void> {
   await supabaseAdmin
     .from('disparos')
-    .update({ pausado_em: new Date().toISOString(), pausa_motivo: motivo })
+    .update({ pausado_em: new Date().toISOString(), pausa_motivo: motivo, pausa_codigo: codigo })
     .eq('id', disparoId);
   proximoEnvioEm.delete(disparoId);
-  logger.warn({ disparoId, motivo }, 'disparo pausado automaticamente');
+  logger.warn({ disparoId, codigo, motivo }, 'disparo pausado automaticamente');
 }
 
 /** Primeiro nome, para o texto soar como gente. "MARIA DAS GRAÇAS SILVA"
@@ -362,17 +650,53 @@ export function primeiroNome(nomeCompleto: string): string {
   return primeiro.charAt(0).toUpperCase() + primeiro.slice(1).toLowerCase();
 }
 
-async function enviarProximo(disparo: DisparoRow, agora: Date): Promise<string> {
-  const { data: alvos, error: erroAlvo } = await supabaseAdmin
-    .from('disparo_alvos')
-    .select('id, telefone, cliente_id, texto_gerado, tentativas')
-    .eq('disparo_id', disparo.id)
-    .eq('status', 'pendente')
-    .order('agendado_para', { ascending: true, nullsFirst: true })
-    .limit(1);
-  if (erroAlvo) throw new Error(`falha ao pegar o próximo alvo: ${erroAlvo.message}`);
+/**
+ * Garante um JID canônico para este eleitor, resolvendo se preciso.
+ *
+ * ESTA É A CORREÇÃO DE D-03, e ela mora aqui — no caminho do envio — de
+ * propósito, além de existir no pré-voo da rota. A razão é que o modo de
+ * falha é silencioso: `sendMessage()` para um JID inexistente devolve um
+ * `key.id` normalmente e a mensagem some. Depender de alguém ter clicado
+ * "verificar" antes seria deixar a falha silenciosa a uma distração de
+ * distância.
+ *
+ * Custo real: uma consulta por eleitor, UMA VEZ NA VIDA — o resultado vai
+ * para hub.clientes.wa_jid e nunca mais é reconsultado.
+ *
+ * Devolve `undefined` quando não foi possível verificar (rede, rate
+ * limit), que é diferente de `null` (verificado e não tem WhatsApp).
+ */
+async function resolverJid(
+  canal: ChannelPort,
+  cliente: ClienteRow,
+): Promise<string | null | undefined> {
+  if (cliente.wa_jid) return cliente.wa_jid;
+  if (!canal.verificarNoWhatsApp) return undefined;
 
-  const alvo = (alvos ?? [])[0] as AlvoRow | undefined;
+  const mapa = await canal.verificarNoWhatsApp([cliente.telefone]);
+  const digitos = cliente.telefone.replace(/\D/g, '');
+  if (!mapa.has(digitos)) return undefined; // não deu para verificar
+
+  const jid = mapa.get(digitos) ?? null;
+  if (jid) {
+    await supabaseAdmin.from('clientes').update({ wa_jid: jid }).eq('id', cliente.id);
+  }
+  return jid;
+}
+
+async function enviarProximo(disparo: DisparoRow, agora: Date): Promise<string> {
+  // RESERVA ATÔMICA (D-11). Antes disto era `select ... limit 1` e o
+  // `update` só acontecia depois do envio — segundos depois. Nessa janela
+  // um segundo processo lia o MESMO alvo, e o índice único só barra a
+  // duplicata depois de a mensagem ter saído. A RPC usa
+  // `FOR UPDATE SKIP LOCKED`: duas instâncias simultâneas recebem alvos
+  // diferentes, nenhuma espera a outra.
+  const { data: reservados, error: erroAlvo } = await supabaseAdmin.rpc('reservar_proximo_alvo', {
+    p_disparo_id: disparo.id,
+  });
+  if (erroAlvo) throw new Error(`falha ao reservar o próximo alvo: ${erroAlvo.message}`);
+
+  const alvo = ((reservados ?? []) as unknown as AlvoRow[])[0];
   if (!alvo) return 'sem_pendentes';
 
   if (!alvo.cliente_id) {
@@ -416,11 +740,39 @@ async function enviarProximo(disparo: DisparoRow, agora: Date): Promise<string> 
 
   const canal = canalEmMemoria(disparo.canal_id!) ?? (await obterOuCriarCanal(disparo.canal_id!));
 
+  // O JID canônico é PRÉ-REQUISITO do envio de campanha, não uma
+  // otimização — ver resolverJid e o defeito D-03. Um alvo sem JID
+  // resolvido não é enviado por número reconstruído: preferimos não
+  // mandar a mandar para o vazio contando como sucesso.
+  const jid = await resolverJid(canal, cliente);
+
+  if (jid === null) {
+    await marcarAlvo(
+      alvo.id,
+      'sem_whatsapp',
+      null,
+      'Número não está registrado no WhatsApp (verificado no envio).',
+      alvo.tentativas + 1,
+    );
+    return 'sem_whatsapp';
+  }
+
+  if (jid === undefined) {
+    // NÃO SEI ≠ NÃO TEM. Devolve para a fila e tenta na próxima passada:
+    // marcar como sem_whatsapp aqui excluiria da campanha, para sempre,
+    // alguém que só teve o azar de uma falha de rede.
+    await supabaseAdmin
+      .from('disparo_alvos')
+      .update({ status: 'pendente', reservado_em: null })
+      .eq('id', alvo.id);
+    return 'jid_nao_verificado';
+  }
+
   // "Digitando…" antes de mandar. O ChannelPort expõe isso como opcional —
   // transporte que não tem o conceito simplesmente não implementa.
   if (canal.sinalizarDigitando) {
     try {
-      await canal.sinalizarDigitando(cliente.telefone, tempoDigitandoMs(texto), cliente.wa_jid ?? undefined);
+      await canal.sinalizarDigitando(cliente.telefone, tempoDigitandoMs(texto), jid);
     } catch {
       // Presença é cosmética. Falhar aqui não pode impedir a mensagem.
     }
@@ -430,7 +782,7 @@ async function enviarProximo(disparo: DisparoRow, agora: Date): Promise<string> 
     conversaId: '',
     telefone: cliente.telefone,
     texto,
-    waJidDestino: cliente.wa_jid ?? undefined,
+    waJidDestino: jid,
   });
 
   const conversaId = await garantirConversa(disparo, cliente, agora);

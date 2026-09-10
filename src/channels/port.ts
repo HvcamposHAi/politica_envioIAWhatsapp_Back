@@ -166,6 +166,78 @@ export interface ChannelPort {
 
   /** Registra o handler de mensagens recebidas. Um canal, um handler. */
   aoReceber(handler: (evento: EventoRecebido) => Promise<void>): void;
+
+  /**
+   * Resolve o JID canônico de cada telefone — o "pré-voo" da campanha.
+   *
+   * POR QUE ISTO É O ESTÁGIO 1 DE TODO DISPARO, e não uma otimização:
+   * `enviar()` para um JID que não existe NÃO FALHA. O WhatsApp aceita o
+   * stanza, o Baileys devolve um `key.id` normalmente, e a mensagem vai
+   * para lugar nenhum. Sem esta resolução, uma campanha inteira reporta
+   * 100% de sucesso com zero entregas — foi o defeito D-03 do dossiê de
+   * 10/09/2026, e é a razão pela qual "enviado" não significava nada.
+   *
+   * Reconstruir o JID por dígitos (`${telefone}@s.whatsapp.net`) não
+   * substitui isto em lugar nenhum do Brasil: o número pode estar
+   * registrado COM ou SEM o nono dígito, e contato roteado por `@lid` não
+   * é alcançável por número nenhum.
+   *
+   * Devolve um mapa telefone (só dígitos) -> JID canônico, ou `null` para
+   * quem não está no WhatsApp. Telefone ausente do mapa = não foi possível
+   * verificar (erro de rede, rate limit); quem chama NÃO deve tratar isso
+   * como "não tem WhatsApp".
+   *
+   * OPCIONAL: transporte sem o conceito (Twilio/WABA) não implementa, e
+   * quem chama trata a ausência.
+   */
+  verificarNoWhatsApp?(telefones: string[]): Promise<Map<string, string | null>>;
+
+  /**
+   * Registra o handler de confirmação de entrega (ack).
+   *
+   * Sem isto, `status: 'enviada'` significa apenas "o transporte aceitou"
+   * — que é uma afirmação sobre nós, não sobre a pessoa do outro lado
+   * (D-04 do dossiê). O ack é a única evidência de que a mensagem chegou.
+   *
+   * O handler pode ser chamado FORA DE ORDEM e mais de uma vez para o
+   * mesmo `waMessageId`: o WhatsApp não garante ordem entre 'entregue' e
+   * 'lido'. Quem implementa o handler é responsável por só avançar o
+   * estado, nunca regredir (ver RANK_STATUS_ENTREGA em services/mensagens.ts).
+   *
+   * OPCIONAL: a Twilio entrega o mesmo sinal por webhook (webhooks/twilio.ts),
+   * não por evento de socket.
+   */
+  aoConfirmarEntrega?(handler: (ack: AckEntrega) => Promise<void>): void;
+
+  /**
+   * A linha está estável o bastante para DISPARO EM MASSA?
+   *
+   * Diferente de `status() === 'conectado'`. O socket abre antes de a
+   * sessão estar de fato utilizável, e a reconexão automática é justamente
+   * o momento em que o worker acorda com uma fila cheia na mão — mandar
+   * campanha nesse instante é o padrão de tráfego que mais parece
+   * automação para o outro lado.
+   *
+   * Só o disparo consulta isto. Mensagem de atendente respondendo um
+   * cliente continua saindo assim que o socket aceita: fazer o atendente
+   * esperar o aquecimento seria transformar uma proteção de campanha em
+   * atraso de atendimento.
+   *
+   * OPCIONAL: ausência significa "sempre pronto", que é o certo para
+   * transporte REST (Twilio) — lá não existe sessão para aquecer.
+   */
+  prontoParaCampanha?(): boolean;
+}
+
+/** Uma confirmação de entrega vinda do transporte. */
+export interface AckEntrega {
+  /** id da mensagem no provedor — a mesma chave devolvida por `enviar()`. */
+  waMessageId: string;
+  /** Estado alcançado. Vocabulário de hub.mensagens.status_entrega, para
+   *  não obrigar cada consumidor a traduzir números de ack do WhatsApp. */
+  status: 'enviada' | 'entregue' | 'lida' | 'falhou';
+  /** JID do destinatário, quando o evento o traz. Só para log. */
+  waJidDestino?: string;
 }
 
 /** Erro específico: transporte não suporta a operação pedida (ex.: disparo
