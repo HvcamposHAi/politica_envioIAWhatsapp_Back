@@ -12,7 +12,14 @@ import { requireSupabaseAuth } from '../auth/middleware.js';
 import { supabaseAdmin } from '../db/client.server.js';
 import { buscarAtendenteAutenticado, empresasDoAtendente } from '../auth/escopoConversa.js';
 import { aplicarCampos, minutosDoDia } from '../services/ritmoDisparo.js';
-import { disparoHabilitado, pararTudo, primeiroNome, religarDisparos } from '../jobs/disparador.js';
+import {
+  disparoHabilitado,
+  pararTudo,
+  primeiroNome,
+  processoPodeDisparar,
+  religarDisparos,
+} from '../jobs/disparador.js';
+import { canalEmMemoria, obterOuCriarCanal } from '../channels/registry.js';
 import { emLotes, gerarLote, type EleitorParaPersonalizar } from '../services/personalizacaoIA.js';
 
 export const disparosRouter = Router();
@@ -156,7 +163,15 @@ disparosRouter.get('/disparos', async (req, res) => {
       .limit(50);
     if (error) throw new Error(error.message);
 
-    res.status(200).json({ disparos: data ?? [], envioHabilitado: disparoHabilitado() });
+    res.status(200).json({
+      disparos: data ?? [],
+      envioHabilitado: await disparoHabilitado(ctx.empresaId),
+      // POR QUE o envio está desligado, e não só que está. Um booleano sem
+      // causa foi o que fez a investigação de 04/09 custar horas: a tela
+      // não tinha como distinguir "o admin parou" de "a chave-geral do
+      // ambiente nunca foi ligada".
+      envioBloqueadoPorAmbiente: !processoPodeDisparar(),
+    });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -289,11 +304,42 @@ disparosRouter.post('/disparos/:id/preparar', async (req, res) => {
     // pediram descadastro" em vez de estourar um erro de banco na cara do
     // admin.
     const aptos = linhas.map((m) => m.clientes).filter((c): c is NonNullable<typeof c> => !!c);
-    const podem = aptos.filter((c) => c.situacao === 'ativo' && !c.opt_out_em);
-    const removidos = aptos.length - podem.length;
+    const podemPorSituacao = aptos.filter((c) => c.situacao === 'ativo' && !c.opt_out_em);
+    const removidos = aptos.length - podemPorSituacao.length;
+
+    /* GUARDA CROSS-CAMPANHA (D-09).
+     *
+     * O índice único de hub.disparo_alvos é (disparo_id, telefone): ele
+     * protege dentro da campanha e não enxerga NADA entre campanhas. Em
+     * 04/09 duas campanhas de teste ficaram vivas apontando para a mesma
+     * lista de quatro pessoas — retomar as duas entregaria mensagem em
+     * dobro para cada uma delas.
+     *
+     * Receber a mesma campanha duas vezes é o tipo de erro que a pessoa do
+     * outro lado não perdoa, e que nenhuma explicação depois desfaz. */
+    const { data: jaNaFila, error: erroFila } = await supabaseAdmin
+      .from('disparo_alvos')
+      .select('cliente_id, disparos!inner(empresa_id, status)')
+      .in('status', ['pendente', 'enviando_agora'])
+      .eq('disparos.empresa_id', ctx.empresaId)
+      .eq('disparos.status', 'enviando');
+    if (erroFila) throw new Error(erroFila.message);
+
+    const ocupados = new Set(
+      ((jaNaFila ?? []) as unknown as Array<{ cliente_id: string | null }>)
+        .map((l) => l.cliente_id)
+        .filter((id): id is string => !!id),
+    );
+
+    const podem = podemPorSituacao.filter((c) => !ocupados.has(c.id));
+    const jaEmOutraCampanha = podemPorSituacao.length - podem.length;
 
     if (!podem.length) {
-      return res.status(400).json({ error: 'Nenhum eleitor da lista pode receber disparo agora.' });
+      return res.status(400).json({
+        error: jaEmOutraCampanha
+          ? 'Todos os eleitores desta lista já estão na fila de outra campanha em andamento.'
+          : 'Nenhum eleitor da lista pode receber disparo agora.',
+      });
     }
 
     let inseridos = 0;
@@ -309,11 +355,131 @@ disparosRouter.post('/disparos/:id/preparar', async (req, res) => {
       inseridos += lote.length;
     }
 
+    const avisos: string[] = [];
+    if (removidos) {
+      avisos.push(
+        `${removidos} pessoa(s) da lista não entraram: pediram descadastro ou estão bloqueadas.`,
+      );
+    }
+    if (jaEmOutraCampanha) {
+      avisos.push(
+        `${jaEmOutraCampanha} pessoa(s) ficaram de fora porque já estão na fila de outra ` +
+          'campanha em andamento — evitando mensagem repetida.',
+      );
+    }
+
     res.status(200).json({
       preparados: inseridos,
       removidos,
-      aviso: removidos
-        ? `${removidos} pessoa(s) da lista não entraram: pediram descadastro ou estão bloqueadas.`
+      jaEmOutraCampanha,
+      aviso: avisos.length ? avisos.join(' ') : undefined,
+      proximoPasso:
+        'Verifique quem tem WhatsApp antes de iniciar — números não registrados não recusam o ' +
+        'envio, eles o aceitam em silêncio.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+/**
+ * POST /disparos/:id/verificar-whatsapp — o pré-voo (estágio 1).
+ *
+ * POR QUE ISTO PRECISA EXISTIR COMO PASSO VISÍVEL, e não só como guarda
+ * escondida no worker: `sendMessage()` para um número que não está no
+ * WhatsApp NÃO FALHA. O stanza é aceito, o Baileys devolve um id, e a
+ * mensagem vai para lugar nenhum. Sem este passo, a campanha reporta 100%
+ * de sucesso com zero entregas — foi o defeito D-03, e é o motivo pelo
+ * qual "o número não enviou" não aparecia em lugar nenhum do painel.
+ *
+ * O resultado é gravado em hub.clientes.wa_jid e serve para sempre: é
+ * também o único jeito correto de alcançar contato roteado por `@lid` e de
+ * resolver o nono dígito, que o JID reconstruído por dígitos chuta.
+ *
+ * Idempotente. Chamar de novo só reconsulta quem ainda não tem JID.
+ */
+disparosRouter.post('/disparos/:id/verificar-whatsapp', async (req, res) => {
+  try {
+    const ctx = await exigirAdmin(req.auth!.userId, req.body?.empresaId);
+    if ('erro' in ctx) return res.status(ctx.erro).json({ error: ctx.mensagem });
+
+    const disparo = await disparoDaEmpresa(req.params.id, ctx.empresaId);
+    if (!disparo) return res.status(404).json({ error: 'Disparo não encontrado.' });
+    if (!disparo.canal_id) return res.status(400).json({ error: 'Disparo sem linha escolhida.' });
+
+    const canal = canalEmMemoria(disparo.canal_id) ?? (await obterOuCriarCanal(disparo.canal_id));
+    if (!canal.verificarNoWhatsApp) {
+      return res.status(409).json({
+        error: 'Esta linha não sabe verificar números. Verificação disponível só em linhas Baileys.',
+      });
+    }
+    if (canal.prontoParaCampanha && !canal.prontoParaCampanha()) {
+      return res.status(409).json({
+        error:
+          'A linha acabou de conectar. Espere cerca de um minuto para ela assentar antes de verificar.',
+      });
+    }
+
+    const { data: alvos, error } = await supabaseAdmin
+      .from('disparo_alvos')
+      .select('id, telefone, cliente_id, clientes(id, wa_jid)')
+      .eq('disparo_id', disparo.id)
+      .eq('status', 'pendente');
+    if (error) throw new Error(error.message);
+
+    type Linha = {
+      id: string;
+      telefone: string;
+      cliente_id: string | null;
+      clientes: { id: string; wa_jid: string | null } | null;
+    };
+    const linhas = (alvos ?? []) as unknown as Linha[];
+    if (!linhas.length) {
+      return res.status(400).json({ error: 'Nenhum alvo pendente. Prepare a fila antes de verificar.' });
+    }
+
+    // Quem já tem JID salvo não é reconsultado: o resultado não muda e a
+    // consulta conta para o limite do WhatsApp do mesmo jeito.
+    const semJid = linhas.filter((l) => l.clientes && !l.clientes.wa_jid);
+    const jaTinham = linhas.length - semJid.length;
+
+    const mapa = await canal.verificarNoWhatsApp(semJid.map((l) => l.telefone));
+
+    let comWhatsApp = 0;
+    let semWhatsApp = 0;
+    let naoVerificados = 0;
+
+    for (const linha of semJid) {
+      const digitos = linha.telefone.replace(/\D/g, '');
+      // Ausente do mapa = NÃO FOI POSSÍVEL VERIFICAR (rede, limite), que é
+      // diferente de "não tem WhatsApp". Excluir alguém da campanha por
+      // uma falha de rede seria pior que não verificar.
+      if (!mapa.has(digitos)) {
+        naoVerificados += 1;
+        continue;
+      }
+      const jid = mapa.get(digitos) ?? null;
+      if (jid) {
+        comWhatsApp += 1;
+        await supabaseAdmin.from('clientes').update({ wa_jid: jid }).eq('id', linha.clientes!.id);
+      } else {
+        semWhatsApp += 1;
+        await supabaseAdmin
+          .from('disparo_alvos')
+          .update({ status: 'sem_whatsapp', erro: 'Número não está registrado no WhatsApp.' })
+          .eq('id', linha.id);
+      }
+    }
+
+    res.status(200).json({
+      total: linhas.length,
+      jaTinhamJid: jaTinham,
+      comWhatsApp: jaTinham + comWhatsApp,
+      semWhatsApp,
+      naoVerificados,
+      aviso: naoVerificados
+        ? `${naoVerificados} número(s) não puderam ser verificados agora. Eles seguem na fila e ` +
+          'serão verificados no momento do envio — rode de novo se quiser o número exato antes.'
         : undefined,
     });
   } catch (err) {
@@ -433,7 +599,7 @@ disparosRouter.post('/disparos/parar-tudo', async (req, res) => {
     if ('erro' in ctx) return res.status(ctx.erro).json({ error: ctx.mensagem });
 
     const motivo = String(req.body?.motivo ?? 'Parada manual pelo painel.');
-    const pausados = await pararTudo(motivo);
+    const pausados = await pararTudo(ctx.empresaId, motivo);
     res.status(200).json({ parado: true, disparosPausados: pausados });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -447,8 +613,14 @@ disparosRouter.post('/disparos/religar', async (req, res) => {
     const ctx = await exigirAdmin(req.auth!.userId, req.body?.empresaId);
     if ('erro' in ctx) return res.status(ctx.erro).json({ error: ctx.mensagem });
 
-    religarDisparos();
-    res.status(200).json({ envioHabilitado: true });
+    await religarDisparos(ctx.empresaId);
+    // Religar a empresa não vence a chave-geral do ambiente. Dizer
+    // "envioHabilitado: true" quando DISPARO_ATIVO=false seria repetir na
+    // resposta da API a mesma mentira que a tela contava (D-13).
+    res.status(200).json({
+      envioHabilitado: await disparoHabilitado(ctx.empresaId),
+      envioBloqueadoPorAmbiente: !processoPodeDisparar(),
+    });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }

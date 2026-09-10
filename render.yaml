@@ -42,34 +42,36 @@ services:
     # latência em cada uma delas.
     region: oregon
 
-    # ⚠️  GRATUITO — ESCOLHA CONSCIENTE, COM PRAZO DE VALIDADE (02/09/2026)
+    # PAGO — E ISTO NAO E OTIMIZACAO DE CUSTO.
     #
-    # O plano `free` do Render SUSPENDE o serviço depois de ~15 minutos sem
-    # requisição HTTP. Para ESTE backend, isso quebra três coisas:
+    # O plano `free` do Render SUSPENDE o servico depois de ~15 minutos sem
+    # requisicao HTTP. Para ESTE backend, isso quebra tres coisas:
     #
-    #   1. As linhas de WhatsApp caem. Os sockets vivem na memória do
-    #      processo; suspender é desconectar todas.
-    #   2. Nada acorda o serviço sozinho. Ele volta com uma requisição
-    #      HTTP — e mensagem de WhatsApp que chega NÃO é uma: é um
-    #      WebSocket que o processo abre. A linha fica fora do ar até
-    #      alguém abrir o painel.
-    #   3. O worker de disparo para. É setInterval: processo suspenso,
+    #   1. As linhas de WhatsApp caem. Os sockets vivem na memoria do
+    #      processo; suspender e desconectar todas.
+    #   2. Nada acorda o servico sozinho. Ele volta com uma requisicao
+    #      HTTP — e mensagem de WhatsApp que chega NAO e uma: e um
+    #      WebSocket que o processo abre. A linha fica fora do ar ate
+    #      alguem abrir o painel.
+    #   3. O worker de disparo para. E setInterval: processo suspenso,
     #      campanha parada no meio, sem aviso nenhum.
     #
-    # Ou seja: no gratuito o sistema funciona enquanto alguém está com a
-    # aba aberta, e para poucos minutos depois de fechar.
+    # ISTO DEIXOU DE SER TEORIA EM 04/09/2026. A campanha de teste nao
+    # enviou nenhuma mensagem, e a instancia que segurava a posse do
+    # gateway tinha `-hibernate-` no proprio hostname. Pior que a
+    # suspensao foi o que ela deixou para tras: ao acordar, o worker viu a
+    # linha fora do ar e PAUSOU as duas campanhas — a linha voltou nove
+    # segundos depois, e elas ficaram paradas para sempre, porque ninguem
+    # retomava campanha automaticamente.
     #
-    # POR QUE ENTÃO ESTÁ `free` AQUI: é suficiente para subir, conferir
-    # /health, fazer login, ler o QR e mandar uma mensagem de teste — tudo
-    # com alguém olhando a tela. Serve para validar o deploy.
+    # A retomada governada (jobs/disparador.ts, retomarOQueCaiu) cobre a
+    # queda transitoria agora. Ela NAO substitui o plano pago: com o
+    # servico suspenso nao ha processo para retomar nada.
     #
-    # TROQUE PARA `starter` ANTES de qualquer uma destas duas coisas:
-    #   · deixar a linha conectada esperando eleitor fora do horário;
-    #   · ligar DISPARO_ATIVO=true.
-    #
-    # É a mesma razão pela qual a infraestrutura anterior exigia instância
-    # sempre acordada — não era otimização de custo.
-    plan: free
+    # O comentario que ficou aqui ate 10/09/2026 dizia "TROQUE PARA
+    # starter ANTES de ligar DISPARO_ATIVO", com prazo 02/09/2026. O prazo
+    # venceu e a troca nao aconteceu.
+    plan: starter
 
     numInstances: 1
 
@@ -122,10 +124,21 @@ services:
         value: "15"
       - key: DISPARO_LIMIAR_OPTOUT_PCT
         value: "5"
-      # FALSO NO PRIMEIRO DEPLOY, de propósito. O worker sobe e não faz
+      # FALSO NO PRIMEIRO DEPLOY, de proposito. O worker sobe e nao faz
       # nada. Ligar depois de conferir a linha conectada e de passar no
-      # teste de responder "SAIR" é muito mais barato que descobrir um
-      # problema com mensagem já saindo.
+      # teste de responder "SAIR" e muito mais barato que descobrir um
+      # problema com mensagem ja saindo.
+      #
+      # DUAS CHAVES, NAO UMA (desde 10/09/2026). Esta e a chave-geral do
+      # PROCESSO. O botao "Parar tudo" do painel opera outra, por empresa,
+      # em hub.empresas.disparo_ativo — que sobrevive a restart. Antes as
+      # duas eram a mesma variavel em memoria, e todo deploy devolvia o
+      # estado ao valor daqui sem ninguem perceber: "Parar tudo" clicado
+      # as 18h nao valia mais as 19h (D-13).
+      #
+      # Com esta desligada NENHUMA mensagem sai, e o painel agora diz isso
+      # em vez de anunciar "religado" e nao fazer nada
+      # (envioBloqueadoPorAmbiente em GET /disparos).
       - key: DISPARO_ATIVO
         value: "false"
 
