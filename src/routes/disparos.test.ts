@@ -377,12 +377,31 @@ describe('pausar, retomar e parar tudo', () => {
 
   it('retoma limpando o motivo', async () => {
     est.disparos[0].pausado_em = '2026-09-01T10:00:00Z';
+    est.disparos[0].pausa_codigo = 'linha_caiu';
     await request(app)
       .post('/disparos/d1/retomar')
       .set('x-teste-user-id', ADMIN)
       .send({ empresaId: EMPRESA });
     expect(est.disparos[0].pausado_em).toBeNull();
     expect(est.disparos[0].pausa_motivo).toBeNull();
+    // Campanha ativa não carrega código de pausa. Um `linha_caiu` que
+    // sobrasse aqui armaria a retomada automática contra a próxima pausa
+    // manual.
+    expect(est.disparos[0].pausa_codigo).toBeNull();
+  });
+
+  it('pausa manual vira parada_manual — a retomada automática nunca a desfaz', async () => {
+    // A sequência que quebrava: a linha cai (linha_caiu), o admin retoma à
+    // mão, depois pausa à mão. Sem sobrescrever o código, a retomada
+    // automática via `linha_caiu` e desfazia uma pausa HUMANA.
+    est.disparos[0].pausa_codigo = 'linha_caiu';
+    const r = await request(app)
+      .post('/disparos/d1/pausar')
+      .set('x-teste-user-id', ADMIN)
+      .send({ empresaId: EMPRESA });
+    expect(r.status).toBe(200);
+    expect(est.disparos[0].pausado_em).toBeTruthy();
+    expect(est.disparos[0].pausa_codigo).toBe('parada_manual');
   });
 
   it('o botão vermelho chama o worker e reporta quantos parou', async () => {

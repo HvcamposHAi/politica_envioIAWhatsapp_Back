@@ -559,6 +559,12 @@ disparosRouter.post('/disparos/:id/pausar', async (req, res) => {
       .update({
         pausado_em: new Date().toISOString(),
         pausa_motivo: String(req.body?.motivo ?? 'Pausado manualmente.'),
+        // SEMPRE parada_manual, sobrescrevendo o que houver. Sem isto, um
+        // `linha_caiu` que sobrou de uma queda anterior continuaria na
+        // linha, e a retomada automática desfaria esta pausa HUMANA na
+        // próxima passada — o contrário exato da regra de que decisão de
+        // gente vence sempre.
+        pausa_codigo: 'parada_manual',
       })
       .eq('id', disparo.id);
     res.status(200).json({ status: 'pausado' });
@@ -577,7 +583,10 @@ disparosRouter.post('/disparos/:id/retomar', async (req, res) => {
 
     await supabaseAdmin
       .from('disparos')
-      .update({ pausado_em: null, pausa_motivo: null })
+      // pausa_codigo junto: uma campanha ativa não carrega motivo de pausa.
+      // Deixar o código antigo aqui é o que armava a retomada automática
+      // indevida descrita em /pausar.
+      .update({ pausado_em: null, pausa_motivo: null, pausa_codigo: null })
       .eq('id', disparo.id);
     res.status(200).json({ status: 'enviando' });
   } catch (err) {
