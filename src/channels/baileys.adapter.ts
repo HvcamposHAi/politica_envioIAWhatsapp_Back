@@ -271,6 +271,34 @@ export class BaileysChannel implements ChannelPort {
       // conectados do usuário). Sem isto, o padrão do Baileys expõe
       // detalhe de versão da lib que não interessa ao atendente.
       browser: ['Hub de WhatsApp', 'Chrome', '1.0.0'],
+      // FALSO DE PROPÓSITO — achado do incidente de banda de 11/09/2026.
+      //
+      // `syncFullHistory` é `true` por padrão na lib (Defaults/index.js).
+      // Confirmado lendo o fonte: esse valor vira `requireFullSync` no
+      // payload de conexão (validate-connection.js) — ou seja, TODA
+      // conexão pede ao WhatsApp para reenviar o histórico completo de
+      // conversas (a lib reserva até 10 GB de cota para isso,
+      // historySyncConfig.storageQuotaMb). Com o serviço no plano Free do
+      // Render (hiberna por inatividade), cada ciclo de hibernar/acordar
+      // reconectava o socket e disparava esse resync de novo — foi isso,
+      // não uso normal, que estourou a banda gratuita do workspace em
+      // poucos dias com um projeto sem nenhuma campanha enviada ainda.
+      //
+      // Seguro desligar: o Hub nunca consome o evento `messaging-history.set`
+      // do Baileys (conferido por busca em src/) — o histórico de conversas
+      // desta aplicação vem do próprio fluxo de recebimento
+      // (processarEventoRecebido), gravado em hub.mensagens em tempo real,
+      // nunca do backfill do WhatsApp. Não perde nenhuma mensagem: só para
+      // de baixar de novo, a cada reconexão, um histórico que a aplicação
+      // nunca leu.
+      syncFullHistory: false,
+      // Mesma lógica de "menos tráfego, menos ruído por reconexão": marcar
+      // presença 'available' a cada reconnect é desnecessário aqui — quem
+      // decide presença de disparo é services/ritmoDisparo.ts, no momento
+      // do envio. Reconectar e ficar "online" repetidas vezes por causa de
+      // hibernação também é o tipo de padrão de tráfego que os Riscos #1/#2
+      // do plano (ban por comportamento atípico) pedem para evitar.
+      markOnlineOnConnect: false,
     });
 
     socket.ev.on('creds.update', saveCreds);
